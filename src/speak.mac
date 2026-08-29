@@ -1,0 +1,2615 @@
+.comment\
+**************************************************************
+*
+*              Votrax Text To Speech Program
+*
+*   Originally from February 1984 80'Micro, Page 126-154 
+*
+*        Allows inflection change by imbedded code:	  
+*    #1, #2, #3, #4 ... produce Bass to Soprano changes
+*   #A to #Z produce finer inflection changes (19khz inc.)
+*
+*	(Rob's Retro Computing Archive)
+*	RetroComputingArchive@gmail.com
+*	https://github.com/rcl9
+*
+**************************************************************\
+
+	.Z80
+
+; *** NOTE: Currently the output buffer just uses un-allocated ram
+;	    at 0F100h, which may conflict later with CP/M PLUS.
+
+outbuf		equ	0f100h	; 400 byte output buffer (smaller would do)
+
+; Externals from SBCMON.MAC
+
+extrn		sc01_base
+extrn		port25$image
+extrn		inflec
+extrn		lrflag
+extrn		saveix
+extrn		ixptr
+extrn		linbuf
+extrn		getlin
+extrn		cr
+extrn		lf
+extrn		eot
+extrn		crlf
+extrn		print$string
+extrn		pmsg
+extrn		crtout
+extrn		sc01$timedout
+extrn		pr$string$rs232
+
+public		votrax		; entry point to text input routine
+public		speak		; entry point to routine to speak a line at (SP)
+public		sc01$init	; initialize the votrax chip
+public		send$sc01	; send A to Votrax chip
+
+; ************************************************************
+; 		Send byte to votrax chip
+; ************************************************************
+
+send$sc01:
+	push	af
+	ld	a,(sc01$timedout)
+	or	a
+	jr	nz, exit3
+	pop	af
+
+	push	de
+	push	hl
+	push	bc
+	cp	090h		; #A - #Z inflection command?
+	jr	c,no$az
+	sub	090h
+	and	00011111b	; mask off high 3 bits
+	or	80h		; keep strobe high for now
+	out	(sc01_base+1),a	; send to frequency controller (keep strobe high)
+	ld	(port25$image),a ; and updates its memory image
+	jr	arcexit
+
+no$az:
+	cp	080h
+	jr	c,no$14
+	sub	080h
+	ld	e,a
+	ld	d,0
+	ld	hl,xlate
+	add	hl,de
+	ld	a,(hl)
+	ld	(inflec),a	; save inflection for next time
+	jr	arcexit
+
+; After data is sent out, bring strobe low for 100usec, then bring it high.
+; The data will be latched on the rising edge.
+
+no$14:
+	ld	hl,inflec
+	or	(hl)		; mask on the inflection
+	out	(sc01_base),a	; send the command
+	ld	a,(port25$image)
+	and	07fh		; bring strobe line low
+	out	(sc01_base+1),a
+
+; wait about 100 micro sec
+
+	ld	b,20
+delay2:	ld	hl,(0000)	; 16
+	djnz	delay2		; 13
+
+	ld	a,(port25$image)
+	out	(sc01_base+1),a	; set strobe high again
+
+	; RCL, May 29 2026, time-out in case the chip is dead or does not exist
+	ld	hl, 0ffffh
+
+	waiter2:dec	hl
+	ld	a,h
+	or	l
+	jr	z, timeout
+
+	in	a,(sc01_base)
+	and	40h
+	jr	z,waiter2	; wait till chip done
+
+arcexit:
+	pop	bc
+	pop	hl
+	pop	de
+	ret
+
+exit3:	pop	af
+	ret
+
+timeout:
+	ld	a, 0ffh
+	ld	(sc01$timedout), a
+	call	pr$string$rs232
+	defb	'   --> Votrax SC-01 has timed out. No further communications will be made with it.',cr,lf,eot
+	jr	arcexit
+
+xlate:	db	00,040h,080h,0c0h ; B,T,A,S inflection
+				  ; translation table
+
+; ------------------------ Initialization Routine -----------------------
+
+; set default frequency divider value, de-assert strobe, and turn off
+; votrax synth. chip.
+
+sc01$init:
+	ld	a,0
+	ld	(sc01$timedout), a
+
+	ld	a, 80h or 018h		; 18h = frequency divider
+	out	(sc01_base + 1),a	; set SC01 strobe high,
+					;   	and set freq of chip
+	ld	(port25$image),a	; and preserve its image
+
+	ld	a,03fh			; no sound command
+	call	send$sc01		; send to sc01 chip
+	ret
+
+; ------------------------ Start of Votrax Driver --------------------------
+
+votrax:	call	print$string
+	defb	0dh,0ah,'Votrax Text Voicer (^C exits). #1 to #4 & #A to #Z produce inflection changes.',eot
+	call	sc01$init	; initialize the hardware
+
+; Input the english text here into buffer.
+
+TEST:	call	print$string
+	defb	cr,lf,'>',eot
+	ld	hl,linbuf+1	; input line to normal input buffer
+	ld	c,78		; allow 78 characters input
+	call	getlin		; input a bufered console line
+	ret	c		; return to monitor if control character found
+
+	ld	a,(linbuf+1)	; see if null line
+	cp	cr
+	ret	z		; return to monitor if ^C
+
+	ld	ix,linbuf+1	; point to input line
+	call	begin		; and go convert and speak line
+	jp	test		; and continue
+
+; --------------------- External Line Input Entry Point -----------------
+
+; External modules can call this routine to speak a line of text, using
+; the calling convention:
+;
+;	call	speak
+;	defm	'Speak this line of text',eot
+
+speak:	ld	a,(sc01$timedout)
+	or	a
+	ret	nz
+
+	push	iy
+	push	ix
+	push	hl
+	push	de
+	push	bc
+	push	af
+
+	ld	hl,0
+	add	hl,sp
+	ld	de,12
+	add	hl,de
+	push	hl		; save return addr stack location
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)
+	push	de
+	pop	ix
+speak2:	ld	a,(de)		; find last byte of string
+	inc	de
+	cp	eot
+	jr	nz,speak2
+	pop	hl
+	ld	(hl),e		; put back new return address
+	inc	hl
+	ld	(hl),d
+
+	call	begin		; go speak sentence
+	pop	af
+	pop	bc
+	pop	de
+	pop	hl
+	pop	ix
+	pop	iy
+	ret
+
+; ---------------------  End of init routines  ---------------------------
+
+begin:	LD	DE,OUTBUF	;GET START OF OUTPUT BUFFER
+	LD	B,255		;BYTE COUNTER
+	LD	A,3FH		;BYTE TO CONDITION BUFFER
+CLRBF1:
+	LD	(DE),A		;CONDITION OUTPUT BUFFER
+	INC	DE
+	DJNZ	CLRBF1		;DO ALL 256
+	LD	B,145		;LOAD COUNTER
+CLRBF2:
+	LD	(DE),A		;CONTINUE TO CONDITION
+	INC	DE
+	DJNZ	CLRBF2
+
+; capitalize the input buffer, shift it to left one position as it goes along.
+
+	ld	hl,linbuf	; point to cleaned up buffer
+	push	ix
+	pop	de		; point to input buffer
+	LD	(HL),' '	; FILL FIRST LOCATION WITH BLANK
+	INC	HL		;START TO PUT DATA
+	EX	DE,HL		;SWAP POINTERS
+ML1:	LD	A,(HL)		; GET CHARACTER FROM STRING BUFFER
+	cp	'a'		; test for lower case
+	jr	c,ml2
+	sub	20h
+ML2:	ld	(de),a
+	inc	de
+	inc	hl
+	cp	cr
+	jr	z,ml3
+	cp	eot
+	jr	nz,ml1
+ml3:	ex	de,hl
+	dec	hl
+	LD	(hl),' '	; LOAD BLANKS TO END
+	inc	hl
+	ld	(hl),0
+
+	ld	ix,linbuf	; point to text to convert
+	ld	iy,outbuf
+
+;***************************************************************
+; CHARACTER LOOKUP ROUTINE
+;***************************************************************
+
+CHTYPE:
+	LD	HL,CHTBLE	; POINT TO START OF TABLE
+	LD	A,(ENDTBL)	; GET LENGTH OF TABLE
+	ADD	A,-3		; OBTAIN PROPER LENGTH
+	LD	B,0
+	LD	C,A
+	LD	A,(IX)		; GET STRING CHARACTER
+	INC	HL
+LOOP:
+	INC	HL
+	INC	HL		; LOCATION OF RULE
+	CPI			; HL=HL+1 BC=BC+1
+	JR	Z,MATCH
+	DEC	C
+	DEC	C
+	JR	NZ,LOOP		; GET SET TO SCAN AGAIN
+	JP	INFLT		; CHECK FOR INFLECTION
+;
+MATCH:
+	LD	E,(HL)		; GET LSB OF CHAR RULES
+	INC	HL		;
+	LD	D,(HL)		; GET MSB OF CHAR RULES
+	LD	(SAVEIX),IX
+	EX	DE,HL		; PUT START OF STRING IN HL
+	JP	RULSCN		; COMPARE TO RULES
+;
+;*************************************************************
+; Inflection change routine = #
+;*************************************************************
+;
+INFLT:
+	CP	'#'
+	JP	NZ,G1
+	INC	IX
+	LD	A,(IX)
+	cp	'1'		; less than 1?
+	JP	C,G1		; ignore character then
+	CP	'5'		; greater than 4?
+	JP	NC,a$to$z	; see if freq change character
+
+	sub	'1'		; make 0-3
+	add	a,080h		; add offset
+	jr	code
+
+a$to$z:	cp	'A'		; less than A?
+	jp	c,G1		; yes, ignore character
+	cp	'Z'+1		; greater than Z?
+	jp	nc,G1
+	sub	'A'
+	add	a,096H		; add offset and freq offset
+				; since hardware is 0-31 and
+				; alphabet is only 0-25 so
+				; bias to faster frequencies
+
+CODE:	ld	(iy),a		; load code to output buffer
+	inc	iy
+	JP	G1		; get next character
+
+;************************************************************
+; RULE SCANNING
+;************************************************************
+;
+RULSCN:
+	PUSH	IX
+	POP	DE	; MAKE DE POINTER TO START OF RULES
+RULSN1:
+	CP	(HL)
+	JR	Z,OK
+	JP	NEXTRL
+OK:
+	INC	HL
+	LD	A,(HL)	; GET NEXT RULE CHARACTER
+	CP	'<'
+	JP	Z,LEFT
+	CP	'>'
+	JP	Z,RIGHT
+	CP	'='
+	JP	Z,TXFR	; SET THE PHONEMES TO THE TALK BUFFER
+	INC	IX
+	LD	A,(IX)	; GET NEW STRING CHARACTER
+	JR	RULSN1
+;
+; LEFT SCAN ROUTINE
+;
+LEFT:
+	INC	HL
+	PUSH	HL
+	LD	HL,LRFLAG
+	SET	0,(HL)
+	POP	HL
+	LD	A,(HL)
+	CP	'!'	; NOT ALPHA
+	JP	Z,NOALPH
+	CP	'#'
+	JP	Z,VOWEL	;CHECK VOWELS
+	CP	':'
+	JP	Z,CONSTS	; 0 OR MORE CONSONANTS
+	CP	'+'
+	JP	Z,FRNTVL	; FRONT VOWEL
+	CP	'^'
+	JP	Z,CONSNT	; 1 OR MORE CONSONANTS
+	CP	'.'
+	JP	Z,VCNSNT	; VOICED CONSONANT
+	CP	'&'
+	JP	Z,SIBLNT	; SIBILANT
+	CP	'$'
+	JP	Z,INFCON
+	CP	'>'
+	JP	Z,RIGHT
+	CP	'='
+	JP	Z,TXFR
+	JP	ASCCHK
+;*****************************************************
+;
+;*****************************************************
+;
+RIGHT:
+	INC	HL	; INC TO NEXT CHAR RULE
+	PUSH	HL
+	LD	HL,LRFLAG	; GET L/R FLAG
+	BIT	4,(HL)		; SET AT <>IX PTR TIME
+	JR	NZ,RPASS	; SAVE ONLY ONCE
+	LD	(IXPTR),IX	; SAVE POINTER
+	SET	4,(HL)
+RPASS:
+	RES	0,(HL)		; RESET FOR RIGHT SCAN
+	POP	HL
+	LD	A,(HL)
+	CP	'!'
+	JP	Z,NOALPH	; GOTO BLANK ROUTINE
+	CP	'#'
+	JP	Z,VOWEL		; CHECK FOR VOWELS
+	CP	':'
+	JP	Z,CONSTS	; 0 OR MORE CONSONANTS
+	CP	'^'
+	JP	Z,CONSNT	; CHECK FOR 1 CONSONANT
+	CP	'+'
+	JP	Z,FRNTVL	; CHECK FOR FRONT VOWEL
+	CP	'.'
+	JP	Z,VCNSNT	; VOICED CONSONANT
+	CP	'%'
+	JP	Z,SUFFIX
+	CP	'='
+	JP	Z,TXFR
+	JP	ASCCHK
+; *********************************************************
+; NON-ALPHA TEST   =    !
+; **********************************************************
+
+NOALPH:
+	CALL	SIDER
+RNO:
+	SUB	40H	; TEST FOR NON-ALPHA
+	JP	P,NEXTRL	; GET NEXT RULE IF ANY
+	JP	QUITS
+;
+;***********************************************************
+; TEST FOR ONE OR MORE VOWELS  =  #
+;***********************************************************
+;
+VOWEL:
+	PUSH	HL	; SAVE TABLE RULE POINTER
+	PUSH	BC
+	LD	C,0FFH
+VREPT:	LD	HL,VMESS	; GET PARMS
+	LD	A,(VMLEN)	; LENGTH
+	LD	B,A		; LOAD B WITH LENGTH
+	INC	C
+	CALL	SIDER
+RVOW:
+	CP	(HL)		; COMPARE TO VMESS VALUE
+	JP	Z,VREPT		; MATCH?
+	INC	HL		; INC TO NEXT VMESS VALUE
+	DJNZ	RVOW		; GO BACK AND CHECK
+	LD	A,C
+	OR	A		; IS IT POSITIVE
+	POP	BC
+	POP	HL		; RESTORE RULE POINTER
+	JP	Z,NEXTRL	; MUST MATCH AT LEAST ONE VOWEL
+	call	unsider
+	JP	QUITS
+;
+VMESS:	DB	'AEIOUY'
+VMLEN:	DB	$-VMESS
+;
+;*************************************************************
+; 0 OR MORE CONSONANTS = :
+;*************************************************************
+;
+CONSTS:	PUSH	HL
+CREPT:	LD	HL,CONMES
+	LD	A,(CONLEN)
+	LD	B,A
+	CALL	SIDER
+RCON:
+	CP	(HL)
+	JR	Z,CREPT
+	INC	HL
+	DJNZ	RCON
+	POP	HL	;FAILED TO MATCH
+	call	unsider
+	JP	QUITS
+;*************************************************************
+; MATCH ONE CONSONANT = *
+;*************************************************************
+;
+CONSNT:
+	LD	A,(CONLEN)	;TABLE LENGTH
+	LD	B,A		;B IS THE LOOP LENGTH
+	CALL	SIDER
+RCONS:
+	PUSH	HL		; SAVE RULE PTR
+	LD	HL,CONMES	; START OF CONSONANTS
+CLOOP:
+	CP	(HL)		; COMPARE
+	JR	Z,CMATCH	; SKIP IF FOUND MATCH
+	INC	HL		; INC TO NEXT CONSONANT
+	DJNZ	CLOOP		; CHECK NEXT VALUE
+	POP	HL		; RESORE RULE POINTER
+	JP	NEXTRL		; CHECK NEXT RULE
+CMATCH:
+	POP	HL		; RESTORE RULE POINTER
+	JP	QUITS
+;
+CONMES:
+	DB	'BCDFGHJKLMNPQRSTVWXZ'
+CONLEN:	DB	$-CONMES
+;
+;*****************************************************
+; MATCH A VOICED CONSONANT = .
+;*****************************************************
+;
+VCNSNT:
+	LD	A,(VCONLE)	; TABLE LENGTH
+	LD	B,A
+	CALL	SIDER
+VCRT:
+	PUSH	HL
+	LD	HL,VMESSL
+VLOOP:
+	CP	(HL)
+	JR	Z,VMATCH
+	INC	HL
+	DJNZ	VLOOP
+	POP	HL
+	JP	NEXTRL
+VMATCH:
+	POP	HL
+	JP	QUITS
+;
+VMESSL:	DB	'BDGJLMNRVWZ'
+VCONLE:	DB	$-VMESSL
+;
+;******************************************************
+; MATCH FRONT VOWEL = +
+;******************************************************
+;
+FRNTVL:
+	CALL	SIDER
+FVR:
+	CP	'E'
+	JR	Z,FVMTCH
+	CP	'I'
+	JR	Z,FVMTCH
+	CP	'Y'
+	JR	Z,FVMTCH
+	JP	NEXTRL
+FVMTCH:
+	JP	QUITS
+;
+;***********************************************
+; TEST FOR SUFFIXES
+;***********************************************
+;
+SUFFIX:
+	PUSH	HL		; RIGHT SCAN ONLY
+	INC	IX		; INC STRING POINTER
+	PUSH	IX		; AND SAVE IT
+	LD	A,(SMESSL)	; GET LENGTH
+	LD	B,A
+	LD	HL,SMESS
+SLOOP1:
+	LD	A,(IX)		; GET CHAR
+	CP	(HL)		; COMPARE VALUE
+	JR	Z,SECCHK	; CHECK SECOND VALUE IF THERE
+SLOOP2:
+	DEC	B		; DEC LOOP COUNTER
+	JR	Z,ROUTER	; NO MATCH
+	INC	HL		; INC MESS POINTER
+	LD	A,(HL)		; GET NEXT VALUE
+	CP	','
+	JR	NZ,SLOOP2	; GO TEST AGAIN
+	POP	IX
+	PUSH	IX
+	INC	HL
+	JR	SLOOP1
+SECCHK:
+	INC	HL
+	LD	A,(HL)
+	CP	','
+	JR	Z,FNDMTH
+	INC	IX
+	DJNZ	SLOOP1
+;
+ROUTER:
+	POP	IX
+	POP	HL
+	JP	NEXTRL
+FNDMTH:
+	POP	BC
+	POP	HL
+	JP	RIGHT
+;
+SMESS:	DB	'E,ER,ES,ED,ING,ELY,'
+SMESSL:	DB	$-SMESS
+;
+;*********************************************************
+; CHECK SIBILANTS = &
+;*********************************************************
+;
+SIBLNT:
+	PUSH	HL		; SAVE RULE PTR
+	LD	HL,SIBMES	; GET START OF TABLE
+	LD	A,(SIBLEN)
+	LD	B,A		; SAVE IT
+	CALL	SIBCON		; GO AND COMPARE
+	POP	HL
+	JP	NZ,NEXTRL
+	JP	LEFT
+;
+;*********************************************************
+; INFLUENCING CONSONANT = $
+;*********************************************************
+;
+INFCON:
+	PUSH	HL		; SAVE RULE PTR
+	LD	HL,CONSM
+	LD	A,(CONSLN)
+	LD	B,A
+	CALL	SIBCON		; GO CHECK FOR MATCH
+	POP	HL
+	JP	NZ,NEXTRL
+	JP	LEFT
+;
+;********************************************************
+; COMMON ROUTINE FOR SIBILANT AND INFLUENCING CONSONANT CHECK
+;********************************************************
+;
+SIBCON:
+	DEC	DE	; DEC LEFT POINTER
+	PUSH	DE
+SIBLOP:
+	LD	A,(DE)
+	CP	(HL)
+	JR	Z,CHKAGN	; SKIP IF NO AND CHECK AGAIN
+SIB2:
+	DEC	B		; DEC LOOP COUNTER
+	JR	Z,SIBERR	; ZERO = NO MATCH
+	INC	HL		; INC TABLE POINTER
+	LD	A,(HL)		; GET VALUE
+	CP	','
+	JR	NZ,SIB2		; SKIP IF NOT
+	POP	DE
+	PUSH	DE
+	INC	HL
+	JR	SIBLOP		; CHECK AGAIN
+CHKAGN:
+	INC	HL
+	LD	A,(HL)
+	CP	','
+	JR	Z,FNDIT
+	DEC	DE
+	DJNZ	SIBLOP		; GO BACK AND CHECK
+;
+SIBERR:
+	POP	DE
+	set	7,A		; SET ERROR BIT
+	BIT	7,A	; Z=(b7=0)=FALSE = 0
+	RET
+FNDIT:
+	POP	DE
+	res	7,A		; bit 7=0
+	BIT	7,A		; z=(b7=0)=true=1
+	RET
+;
+SIBMES:	DB	'S,C,G,Z,X,J,HC,HS,'	; BACKWARDS
+SIBLEN:	DB	$-SIBMES
+;
+CONSM:
+	DB	'T,S,R,D,L,Z,N,J,HT,HC,HS,'
+CONSLN:	DB	$-CONSM
+;
+;******************************************************
+; CHECK FOR RIGHT OR LEFT ASCII CHARACTER
+;******************************************************
+;
+ASCCHK:
+	CALL	SIDER
+CHECK:
+	CP	(HL)
+	JP	NZ,NEXTRL
+	JP	QUITS
+;
+; RIGHT OR LEFT TEST TO CHECK SCAN INDICATOR
+;
+SIDER:
+	LD	A,(LRFLAG)	; left or right side call?
+	BIT	0,A
+	JR	NZ,GETDE	; jp if left rule
+	INC	IX		; right rule, get next char
+	LD	A,(IX)		; get character
+	JR	EXIT		; and return
+
+GETDE:
+	DEC	DE		; back up and get character
+	LD	A,(DE)
+EXIT:	RET
+
+
+unsider:
+	ld	a,(lrflag)
+	bit	0,a
+	jr	nz,putde
+	dec	ix
+	ld	a,(ix)
+	jr	unexit
+putde:
+	inc	de
+	ld	a,(de)
+unexit:
+	ret
+
+QUITS:
+	LD	A,(LRFLAG)
+	BIT	0,A
+	JP	Z,RIGHT
+	JP	LEFT
+SIDE:
+	LD	A,(LRFLAG)
+	BIT	0,A
+	RET
+;
+;***************************************
+; SET POINTERS FOR NEXT RULE SCAN
+;*****************************************
+;
+NEXTRL:
+	NOP
+NLOOP:
+	LD	A,(HL)
+	CP	'@'		; GET RULE SEPARATOR
+	JR	Z,FNDNXT
+	CP	'['
+	JP	Z,ERROR
+	INC	HL
+	JR	NLOOP
+;
+FNDNXT:
+	XOR	A		; CLEAR ACCUMULATOR
+	LD	(LRFLAG),A	; CLEAR FLAG WORD
+	LD	IX,(SAVEIX)	; RESTORE IX FOR NEXT RULE
+	LD	A,(IX)		; GET CHAR
+	INC	HL		; SET POINTER PAST @ MARKER
+	JP	RULSCN		; CHECK NEXT RULE
+;
+;********************************************************
+; TRANSFER DATA TO TALK BUFFER
+;********************************************************
+;
+TXFR:
+	INC	HL		; SET POINTER PAST = SIGN
+TLOOP:	LD	A,(HL)		; GET VALUE
+	CP	'@'		; DONE TXFR?
+	JR	Z,GNXTCH	; Z=TEST FOR DONE
+	LD	(IY),A		; PUT DATA TO TALK BUFFER
+	INC	IY
+	INC	HL
+	JR	TLOOP
+;
+GNXTCH:
+	LD	A,(LRFLAG)
+	BIT	4,A		; IS BIT 4 SET?
+	JR	Z,G1
+	LD	IX,(IXPTR)
+G1:
+	INC	IX
+	XOR	A
+	CP	(IX)
+	JR	Z,OUTPUT	; 0 = DONE DECODING
+	LD	(LRFLAG),A	; CLEAR FLAG FOR NEXT RULE
+	JP	CHTYPE
+ERROR:
+	LD	A,0DH
+	CALL	WCHAR
+	LD	A,'$'
+	INC	IX
+	LD	(IX),A
+	LD	HL,linbuf
+	CALL	WSTRING
+	LD	HL,ERRMES
+	JP	RETURN
+WCHAR:
+	PUSH	AF
+	PUSH	BC
+	PUSH	DE
+	PUSH	HL
+	call	crtout
+	POP	HL
+	POP	DE
+	POP	BC
+	POP	AF
+	RET
+
+WSTRING:jp	pmsg
+
+ERRMES:	DB	00,00,2BH,00H,3EH,3AH,3FH,3EH
+
+; Output coded string to Votrax Chip
+
+OUTPUT:	LD	HL,OUTBUF
+
+	ld	a,(sc01$timedout)
+	or	a
+	ret	nz
+
+OUT1:
+OLOOP:
+	LD	A,(HL)
+	CALL	send$sc01
+	LD	A,(HL)
+	CP	3FH
+	JR	Z,RETURN
+OL1:
+	INC	HL
+	JR	OLOOP
+RETURN:
+	XOR	A
+	LD	(LRFLAG),A
+	ret
+;	JP	BEGIN		; return from program here
+
+OLDSTK:	DS	2
+;
+EH3	EQU	00H
+EH2	EQU	01H
+EH1	EQU	02H
+PA0	EQU	03H
+DT	EQU	04H
+A2	EQU	05H
+A1	EQU	06H
+ZH	EQU	07H
+AH2	EQU	08H
+I3	EQU	09H
+I2	EQU	0AH
+I1	EQU	0BH
+MM	EQU	0CH
+N	EQU	0DH
+BB	EQU	0EH
+V	EQU	0FH
+CH	EQU	10H
+SH	EQU	11H
+ZZ	EQU	12H
+AW1	EQU	13H
+NG	EQU	14H
+AH1	EQU	15H
+OO1	EQU	16H
+OO	EQU	17H
+LL	EQU	18H
+K	EQU	19H
+J	EQU	1AH
+HH	EQU	1BH
+G	EQU	1CH
+F	EQU	1DH
+DD	EQU	1EH
+S	EQU	1FH
+AA	EQU	20H
+AY	EQU	21H
+Y1	EQU	22H
+UH3	EQU	23H
+AH	EQU	24H
+PP	EQU	25H
+O	EQU	26H
+II	EQU	27H
+U	EQU	28H
+Y	EQU	29H
+T	EQU	2AH
+RR	EQU	2BH
+EE	EQU	2CH
+W	EQU	2DH
+AE	EQU	2EH
+AE1	EQU	2FH
+AW2	EQU	30H
+UH2	EQU	31H
+UH1	EQU	32H
+UH	EQU	33H
+O2	EQU	34H
+O1	EQU	35H
+IU	EQU	36H
+U1	EQU	37H
+THV	EQU	38H
+TH	EQU	39H
+ER	EQU	3AH
+EH	EQU	3BH
+E1	EQU	3CH
+AW	EQU	3DH
+PA1	EQU	3EH
+STOP	EQU	3FH
+CHTBLE:
+	DS	3
+	DB	'A'
+	DW	ARULES
+	DB	'B'
+	DW	BRULES
+	DB	'C'
+	DW	CRULES
+	DB	'D'
+	DW	DRULES
+	DB	'E'
+	DW	ERULES
+	DB	'F'
+	DW	FRULES
+	DB	'G'
+	DW	GRULES
+	DB	'H'
+	DW	HRULES
+	DB	'I'
+	DW	IRULES
+	DB	'J'
+	DW	JRULES
+	DB	'K'
+	DW	KRULES
+	DB	'L'
+	DW	LRULES
+	DB	'M'
+	DW	MRULES
+	DB	'N'
+	DW	NRULES
+	DB	'O'
+	DW	ORULES
+	DB	'P'
+	DW	PRULES
+	DB	'Q'
+	DW	QRULES
+	DB	'R'
+	DW	RRULES
+	DB	'S'
+	DW	SRULES
+	DB	'T'
+	DW	TRULES
+	DB	'U'
+	DW	URULES
+	DB	'V'
+	DW	VRULES
+	DB	'W'
+	DW	WRULES
+	DB	'X'
+	DW	XRULES
+	DB	'Y'
+	DW	YRULES
+	DB	'Z'
+	DW	ZRULES
+	DB	' '
+	DW	BLANK
+	DB	'.'
+	DW	PERIOD
+	DB	39
+	DW	APOST
+	DB	','
+	DW	COMMA
+	DB	'?'
+	DW	QUEST
+	DB	'1'
+	DW	RULE1
+	DB	'2'
+	DW	RULE2
+	DB	'3'
+	DW	RULE3
+	DB	'4'
+	DW	RULE4
+	DB	'5'
+	DW	RULE5
+	DB	'6'
+	DW	RULE6
+	DB	'7'
+	DW	RULE7
+	DB	'8'
+	DW	RULE8
+	DB	'9'
+	DW	RULE9
+	DB	'0'
+	DW	RULE0
+	db	'-'
+	dw	minus
+	db	'+'
+	dw	plus
+	db	'='
+	dw	equals
+	DB	'*'
+	DW	MULT
+	DB	'/'
+	DW	DIVIDE
+	DB	'<'
+	DW	LTHAN
+	DB	'>'
+	DW	GTHAN
+	DB	'^'
+	DW	TOTHE
+	DB	':'
+	DW	COLON
+	DB	';'
+	DW	SEMICO
+	DB	'!'
+	DW	EXCLA
+	DB	'"'
+	DW	QUOTE
+	DB	'$'
+	DW	DOLLAR
+	DB	'%'
+	DW	PERCNT
+	DB	'('
+	DW	RBRACK
+	DB	')'
+	DW	LBRACK
+	DB	'@'
+	DW	ATSYM
+ENDTBL:	DB	$-CHTBLE
+SPECIAL:	DB	'#?*.$%&@^+:','@'
+
+; ********************************
+; Rule tables
+; ********************************
+
+PUNCTRULES:
+
+ARULES:
+	DB	'A<!>!='
+	DB	A1
+	DB	AY
+	DB	Y
+	DB	'@'
+	DB	'A<!>H='
+	DB	UH2
+	DB	'@'
+	DB	'A>!='
+	DB	UH2
+	DB	'@'
+	DB	'ARE>!='
+	DB	AH,ER,RR,'@'
+	DB	'AR<!>O='
+	DB	UH2,RR,'@'
+	DB	'AR>#='
+	DB	EH2,RR,'@'
+	DB	'AS<^!>#='
+	DB	AE1,EH3,S,'@'
+	DB	'A>WA='
+	DB	UH2
+	DB	'@'
+	DB	'AW='
+	DB	AW
+	DB	'@'
+	DB	'ANY<:!='
+	DB	EH2,EH2,N,Y,'@'
+	DB	'A>^+#='
+	DB	AA
+	DB	AY
+	DB	'@'
+	DB	'ALLY<:#='
+	DB	UH2
+	DB	LL
+	DB	EE
+	DB	'@'
+	DB	'AL<!>#='
+	DB	UH1
+	DB	LL
+	DB	'@'
+	DB	'AGAIN='
+	DB	UH2
+	DB	G
+	DB	EH
+	DB	N
+	DB	'@'
+	DB	'AG<:#>E='
+	DB	I1
+	DB	DD
+	DB	J
+	DB	'@'
+	DB	'A>^+#='
+	DB	AE,'@'
+	DB	'A<:!>^+!='
+	DB	AA
+	DB	AY
+	DB	'@'
+	DB	'A>^%='
+	DB	AA
+	DB	AY
+	DB	'@'
+	DB	'ARR<!='
+	DB	UH1
+	DB	RR
+	DB	'@'
+	DB	'ARR='
+	DB	AE1
+	DB	RR
+	DB	'@'
+	DB	'AT<:!>!='
+	DB	AH
+	DB	T
+	DB	'@'
+	DB	'AR>!='
+	DB	ER
+	DB	'@'
+	DB	'AR='
+	DB	AH1
+	DB	RR
+	DB	'@'
+	DB	'AIR='
+	DB	EH2,EH2
+	DB	RR
+	DB	'@'
+	DB	'AI='
+	DB	AA
+	DB	AY
+	DB	'@'
+	DB	'AY='
+	DB	AA
+	DB	AY
+	DB	'@'
+	DB	'AU='
+	DB	AW
+	DB	'@'
+	DB	'AL<:#>!='
+	DB	UH2
+	DB	LL
+	DB	'@'
+	DB	'ALS<:#>!='
+	DB	UH2
+	DB	LL
+	DB	ZZ
+	DB	'@'
+	DB	'ALK='
+	DB	AW
+	DB	K
+	DB	'@'
+	DB	'AL>^='
+	DB	AW1,UH3
+	DB	LL
+	DB	'@'
+	DB	'ABLE<!>!='
+	DB	A1
+	DB	Y
+	DB	BB
+	DB	UH3
+	DB	LL
+	DB	'@'
+	DB	'ABLE<:!='
+	DB	AA
+	DB	AY
+	DB	BB
+	DB	UH3
+	DB	LL
+	DB	'@'
+	DB	'ABLE='
+	DB	UH2
+	DB	BB
+	DB	UH2
+	DB	LL
+	DB	'@'
+	DB	'ANG>+='
+	DB	A1
+	DB	AY
+	DB	N
+	DB	DD
+	DB	J
+	DB	'@'
+	DB	'A='
+	DB	AE1
+	DB	'@['
+BRULES:
+	DB	'B<!>!='
+	DB	BB
+	DB	E1
+	DB	Y
+	DB	'@'
+	DB	'BE<!>^#='
+	DB	BB
+	DB	Y
+	DB	'@'
+	DB	'BEING='
+	DB	BB
+	DB	E1
+	DB	I2
+	DB	NG
+	DB	'@'
+	DB	'BOTH<!>!='
+	DB	BB
+	DB	O2,O2
+	DB	TH
+	DB	'@'
+	DB	'BUS<!>#='
+	DB	BB
+	DB	I3
+	DB	I3
+	DB	ZZ
+	DB	'@'
+	DB	'BUIL='
+	DB	BB
+	DB	I2
+	DB	I2
+	DB	LL
+	DB	'@'
+	DB	'B='
+	DB	BB
+	DB	'@['
+CRULES:
+	DB	'C<!>!='
+	DB	S
+	DB	E1
+	DB	Y
+	DB	'@'
+	DB	'CH<!>^='
+	DB	K
+	DB	'@'
+	DB	'CH<E^='
+	DB	K
+	DB	'@'
+	DB	'CH='
+	DB	T
+	DB	CH
+	DB	'@'
+	DB	'CI<S!>#='
+	DB	S
+	DB	AH1,I3
+	DB	'@'
+	DB	'CI>A='
+	DB	SH
+	DB	'@'
+	DB	'CI>O='
+	DB	SH
+	DB	'@'
+	DB	'CI>EN='
+	DB	SH
+	DB	'@'
+	DB	'C>+='
+	DB	S
+	DB	'@'
+	DB	'CK='
+	DB	K
+	DB	'@'
+	DB	'COM>%='
+	DB	K
+	DB	UH
+	DB	MM
+	DB	'@'
+	DB	'CON<!='
+	DB	K
+	DB	UH1
+	DB	N
+	DB	'@'
+	DB	'C='
+	DB	K
+	DB	'@['
+DRULES:
+	DB	'D<!>!='
+	DB	DD
+	DB	E1
+	DB	Y
+	DB	'@'
+	DB	'DED<:#>!='
+	DB	DD
+	DB	I2
+	DB	DD
+	DB	'@'
+	DB	'DG='
+	DB	DD
+	DB	J
+	DB	'@'
+	DB	'D<E.>!='
+	DB	DD
+	DB	'@'
+	DB	'D<E^#>!='
+	DB	T
+	DB	'@'
+	DB	'DE<!>^#='
+	DB	DD
+	DB	Y
+	DB	'@'
+	DB	'DO<!>!='
+	DB	DD
+	DB	IU
+	DB	U1,U1
+	DB	'@'
+	DB	'DOES<!='
+	DB	DD
+	DB	UH2,UH1
+	DB	ZZ
+	DB	'@'
+	DB	'DOING<!='
+	DB	DD
+	DB	IU
+	DB	U
+	DB	I2
+	DB	NG
+	DB	'@'
+	DB	'DOW<!='
+	DB	DD
+	DB	AH1,UH3,U1,'@'
+	DB	'DU>A='
+	DB	DD
+	DB	J
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'D='
+	DB	DD
+	DB	'@['
+ERULES:
+	DB	'E<!>!='
+	DB	E1
+	DB	Y
+	DB	'@'
+	DB	'E<!>Q='
+	DB	EE
+	DB	'@'
+	DB	'E<!>#='
+	DB	EE
+	DB	'@'
+	DB	'E<:#>!='
+	DB	'@'
+	DB	'E<^:!>!='
+	DB	'@'
+	DB	'E<:!>!='
+	DB	E1
+	DB	'@'
+	DB	'ED<#>!='
+	DB	I2,DD
+	DB	'@'
+	DB	'E<:#>D!='
+	DB	'@'
+	DB	'EV>ER='
+	DB	EH
+	DB	V
+	DB	'@'
+	DB	'EX='
+	DB	EH1
+	DB	EH2
+	DB	K
+	DB	PA0
+	DB	S
+	DB	'@'
+	DB	'E<V='
+	DB	'@'
+	DB	'E>^%='
+	DB	EE
+	DB	'@'
+	DB	'ERI>#='
+	DB	I1
+	DB	RR
+	DB	Y
+	DB	'@'
+	DB	'ERI='
+	DB	EH1
+	DB	RR
+	DB	I3
+	DB	'@'
+	DB	'ER<:#>#='
+	DB	ER,'@'
+	DB	'ER>#='
+	DB	EH1
+	DB	RR
+	DB	'@'
+	DB	'ER='
+	DB	ER
+	DB	'@'
+	DB	'EVEN<!='
+	DB	EE
+	DB	V
+	DB	EH
+	DB	N
+	DB	'@'
+	DB	'E<:#>W='
+	DB	'@'
+	DB	'EW<$='
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'EW='
+	DB	Y1
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'E>O='
+	DB	EE
+	DB	'@'
+	DB	'ES<&:#>!='
+	DB	I2
+	DB	ZZ
+	DB	'@'
+	DB	'E<:#>S!='
+	DB	'@'
+	DB	'ELL='
+	DB	EH1
+	DB	UH3
+	DB	LL
+	DB	UH3
+	DB	'@'
+	DB	'ELY<:#>!='
+	DB	LL
+	DB	EE
+	DB	'@'
+	DB	'EMENT<:#='
+	DB	MM
+	DB	EH3
+	DB	N
+	DB	T
+	DB	'@'
+	DB	'EFUL='
+	DB	F
+	DB	OO1
+	DB	LL
+	DB	'@'
+	DB	'EE='
+	DB	EE
+	DB	'@'
+	DB	'EARN='
+	DB	ER,RR
+	DB	N
+	DB	'@'
+	DB	'EAR<!>^='
+	DB	ER,RR
+	DB	'@'
+	DB	'EAD='
+	DB	EH1,EH3
+	DB	DD
+	DB	'@'
+	DB	'EA<:#>!='
+	DB	EE
+	DB	UH2
+	DB	'@'
+	DB	'EA>SU='
+	DB	EH
+	DB	'@'
+	DB	'EA='
+	DB	EE
+	DB	'@'
+	DB	'EIGH='
+	DB	A2,A2,Y
+	DB	'@'
+	DB	'EI='
+	DB	EE
+	DB	'@'
+	DB	'EYE<!='
+	DB	AH1,EH3,I3,Y
+	DB	'@'
+	DB	'EY='
+	DB	EE
+	DB	'@'
+	DB	'EU='
+	DB	Y
+	DB	IU
+	DB	U1
+	DB	'@'
+	DB	'E='
+	DB	EH1
+	DB	'@['
+FRULES:
+	DB	'F<!>!='
+	DB	EH1
+	DB	EH2
+	DB	F
+	DB	'@'
+	DB	'FUL='
+	DB	F
+	DB	UH3,LL
+	DB	'@'
+	DB	'F='
+	DB	F
+	DB	'@['
+GRULES:
+	DB	'G<!>!='
+	DB	DD,J
+	DB	E1
+	DB	Y
+	DB	'@'
+	DB	'GIV='
+	DB	G
+	DB	I1,I3
+	DB	V
+	DB	'@'
+	DB	'G<!>I^='
+	DB	G
+	DB	'@'
+	DB	'GE>T='
+	DB	G
+	DB	EH1
+	DB	EH3
+	DB	'@'
+	DB	'GGES<SU='
+	DB	G
+	DB	DD
+	DB	J
+	DB	EH
+	DB	S
+	DB	'@'
+	DB	'GG='
+	DB	G
+	DB	'@'
+	DB	'G<#B!='
+	DB	G
+	DB	'@'
+	DB	'G>+='
+	DB	DD
+	DB	J
+	DB	'@'
+	DB	'GREAT='
+	DB	G
+	DB	RR
+	DB	A1,Y
+	DB	T
+	DB	'@'
+	DB	'GH<#='
+	DB	'@'
+	DB	'G='
+	DB	G
+	DB	'@['
+HRULES:
+	DB	'HEATHER<!>!='
+	DB	HH
+	DB	EH1,EH3
+	DB	THV
+	DB	UH3
+	DB	RR
+	DB	'@'
+	DB	'H<!>!='
+	DB	A1
+	DB	AY
+	DB	Y
+	DB	T
+	DB	CH
+	DB	'@'
+	DB	'HAV<!='
+	DB	HH
+	DB	AE1
+	DB	EH3
+	DB	V
+	DB	'@'
+	DB	'HERE<!='
+	DB	HH
+	DB	AY,I3
+	DB	RR
+	DB	'@'
+	DB	'HOUR<!='
+	DB	AH1,UH3
+	DB	ER
+	DB	'@'
+	DB	'HOW='
+	DB	HH
+	DB	AH1
+	DB	O2,U1
+	DB	'@'
+	DB	'H>#='
+	DB	HH
+	DB	'@'
+	DB	'H='
+	DB	'@['
+IRULES:
+	DB	'IN<!>$='
+	DB	I1
+	DB	N
+	DB	'@'
+	DB	'IN<!='
+	DB	I1
+	DB	N
+	DB	'@'
+	DB	'I<!>!='
+	DB	AH1
+	DB	EH3
+	DB	I3
+	DB	Y
+	DB	'@'
+	DB	'IN>D='
+	DB	I1,I3,N,'@'
+	DB	'IDE='
+	DB	AH1,EH3,Y,DD,'@'
+	DB	'IER='
+	DB	E1,I3
+	DB	ER
+	DB	'@'
+	DB	'IED<R:#>!='
+	DB	EE
+	DB	DD
+	DB	'@'
+	DB	'IED>!='
+	DB	AH
+	DB	EH1
+	DB	DD
+	DB	'@'
+	DB	'IEN='
+	DB	EE
+	DB	EH
+	DB	N
+	DB	'@'
+	DB	'IE>T='
+	DB	AH1
+	DB	EH3
+	DB	AY
+	DB	I2
+	DB	'@'
+	DB	'IQUE='
+	DB	EE
+	DB	K
+	DB	'@'
+	DB	'I<:!>%='
+	DB	AH1
+	DB	EH3
+	DB	'@'
+	DB	'I>%='
+	DB	EE
+	DB	'@'
+	DB	'IE='
+	DB	EE
+	DB	'@'
+	DB	'I>^+:#='
+	DB	II
+	DB	'@'
+	DB	'IR>#='
+	DB	AH1
+	DB	EH3
+	DB	AY
+	DB	RR
+	DB	'@'
+	DB	'IZ>%='
+	DB	AH1
+	DB	Y
+	DB	ZZ
+	DB	'@'
+	DB	'IS>%='
+	DB	AH1
+	DB	Y
+	DB	ZZ
+	DB	'@'
+	DB	'I>D%='
+	DB	I1,I3,'@'
+	DB	'I<^+>^+='
+	DB	II
+	DB	'@'
+	DB	'I>T%='
+	DB	AH
+	DB	E1
+	DB	'@'
+	DB	'I<^:#>^+='
+	DB	II
+	DB	'@'
+	DB	'I>^+='
+	DB	AH2,I2
+	DB	'@'
+	DB	'IR='
+	DB	ER
+	DB	'@'
+	DB	'IGH='
+	DB	AH1
+	DB	EH3
+	DB	Y
+	DB	'@'
+	DB	'ILD='
+	DB	I2,I2,LL,DD,'@'
+	DB	'IGN>!='
+	DB	AH1
+	DB	EH3
+	DB	Y
+	DB	N
+	DB	'@'
+	DB	'IGN>^='
+	DB	AH1
+	DB	EH3
+	DB	Y
+	DB	N
+	DB	'@'
+	DB	'IGN>%='
+	DB	AH1
+	DB	EH3
+	DB	Y
+	DB	N
+	DB	'@'
+	DB	'I='
+	DB	II
+	DB	'@['
+JRULES:
+	DB	'J<!>!='
+	DB	DD
+	DB	J
+	DB	EH3
+	DB	A1
+	DB	AY
+	DB	Y
+	DB	'@'
+	DB	'J='
+	DB	DD
+	DB	J
+	DB	'@['
+KRULES:
+	DB	'K<!>!='
+	DB	K
+	DB	EH3
+	DB	A1
+	DB	AY
+	DB	Y
+	DB	'@'
+	DB	'K<!>N='
+	DB	'@'
+	DB	'K='
+	DB	K
+	DB	'@['
+LRULES:
+	DB	'L<!>!='
+	DB	EH1
+	DB	EH3
+	DB	UH3
+	DB	LL
+	DB	'@'
+	DB	'LO>C#='
+	DB	LL
+	DB	UH3
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'LO>^#='
+	DB	LL
+	DB	O
+	DB	O
+	DB	'@'
+	DB	'L<L='
+	DB	'@'
+	DB	'LE>!='
+	DB	UH3
+	DB	LL
+	DB	'@'
+	DB	'L<^:#>%='
+	DB	UH2
+	DB	LL
+	DB	'@'
+	DB	'LEAD='
+	DB	LL,E1,Y,DD,'@'
+	DB	'LESS>!='
+	DB	LL
+	DB	EH2
+	DB	S
+	DB	'@'
+	DB	'LY>!='
+	DB	LL
+	DB	Y
+	DB	'@'
+	DB	'L='
+	DB	LL
+	DB	'@['
+MRULES:
+	DB	'M<!>!='
+	DB	EH1
+	DB	EH2
+	DB	MM
+	DB	'@'
+	DB	'MC<!>@='
+	DB	MM
+	DB	AE
+	DB	K
+	DB	'@'
+	DB	'MC<!>.='
+	DB	MM
+	DB	UH3
+	DB	'@'
+	DB	'MOV='
+	DB	MM,U1,U1,V,'@'
+	DB	'MENT>!='
+	DB	MM
+	DB	EH3
+	DB	N
+	DB	T
+	DB	'@'
+	DB	'M='
+	DB	MM
+	DB	'@['
+NRULES:
+	DB	'N<!>!='
+	DB	EH1
+	DB	EH2
+	DB	N
+	DB	'@'
+	DB	'NG<E>+='
+	DB	N
+	DB	DD
+	DB	J
+	DB	'@'
+	DB	'NG>R='
+	DB	NG
+	DB	G
+	DB	'@'
+	DB	'NG>#='
+	DB	NG
+	DB	G
+	DB	'@'
+	DB	'NGL>%='
+	DB	NG
+	DB	G
+	DB	UH2
+	DB	LL
+	DB	'@'
+	DB	'NG='
+	DB	NG
+	DB	'@'
+	DB	'NK='
+	DB	NG
+	DB	K
+	DB	'@'
+	DB	'NOW<!>!='
+	DB	N
+	DB	AH1,UH3
+	DB	U1
+	DB	'@'
+	DB	'NESS>!='
+	DB	N
+	DB	EH3
+	DB	S
+	DB	'@'
+	DB	'NON<!='
+	DB	N
+	DB	AH1
+	DB	UH3
+	DB	N
+	DB	'@'
+	DB	'N='
+	DB	N
+	DB	'@['
+ORULES:
+	DB	'O<!>!='
+	DB	O2,O1
+	DB	U1
+	DB	'@'
+	DB	'OF>!='
+	DB	UH2
+	DB	V
+	DB	'@'
+	DB	'OROUGH='
+	DB	ER
+	DB	IU
+	DB	U1
+	DB	'@'
+	DB	'OR<:#>!='
+	DB	ER
+	DB	'@'
+	DB	'ORS<:#>!='
+	DB	ER
+	DB	ZZ
+	DB	'@'
+	DB	'OR='
+	DB	O2,O2
+	DB	RR
+	DB	'@'
+	DB	'ONE<!='
+	DB	W
+	DB	UH1,UH2
+	DB	N
+	DB	'@'
+	DB	'OW<LL='
+	DB	AH1
+	DB	UH3
+	DB	U1
+	DB	'@'
+	DB	'OW='
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'OVER<!='
+	DB	O1
+	DB	O2
+	DB	V
+	DB	ER
+	DB	'@'
+	DB	'OV='
+	DB	UH1
+	DB	V
+	DB	'@'
+	DB	'O>^%='
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'O>^EN='
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'O>^I#='
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'OL>D='
+	DB	O2,O2,LL,LL
+	DB	'@'
+	DB	'ON<I=',UH3,N,'@'
+	DB	'OUGHT='
+	DB	AH1,UH3
+	DB	T
+	DB	'@'
+	DB	'OUGH='
+	DB	UH
+	DB	F
+	DB	'@'
+	DB	'OU<!='
+	DB	AH
+	DB	O1
+	DB	'@'
+	DB	'OU<H>S#='
+	DB	AH
+	DB	O1
+	DB	'@'
+	DB	'OUS='
+	DB	UH2
+	DB	S
+	DB	'@'
+	DB	'OUR='
+	DB	O,RR
+	DB	'@'
+	DB	'OULD='
+	DB	IU,IU,OO1
+	DB	DD
+	DB	'@'
+	DB	'OU<^>^L='
+	DB	UH
+	DB	'@'
+	DB	'OUP='
+	DB	IU
+	DB	U
+	DB	PP
+	DB	'@'
+	DB	'OU='
+	DB	AH
+	DB	O1
+	DB	'@'
+	DB	'OY='
+	DB	O1
+	DB	E1
+	DB	'@'
+	DB	'OING='
+	DB	O1
+	DB	U1
+	DB	II
+	DB	NG
+	DB	'@'
+	DB	'OI='
+	DB	O1,UH3,I3,AY
+	DB	'@'
+	DB	'OOR='
+	DB	O
+	DB	RR
+	DB	'@'
+	DB	'OOK='
+	DB	OO
+	DB	K
+	DB	'@'
+	DB	'OOD='
+	DB	OO
+	DB	DD
+	DB	'@'
+	DB	'OO='
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'O>E='
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'O>!='
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'OA='
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'ONLY<!='
+	DB	O1
+	DB	U1
+	DB	N
+	DB	LL
+	DB	EE
+	DB	'@'
+	DB	'ONCE<!='
+	DB	W
+	DB	UH
+	DB	N
+	DB	S
+	DB	'@'
+	DB	'ON''T='
+	DB	O1
+	DB	U1
+	DB	N
+	DB	T
+	DB	'@'
+	DB	'O<C>N='
+	DB	AH
+	DB	'@'
+	DB	'O>NG='
+	DB	AW
+	DB	'@'
+	DB	'O<^:!>N='
+	DB	UH
+	DB	'@'
+	DB	'ON<I='
+	DB	UH2
+	DB	N
+	DB	'@'
+	DB	'ON<:#>!='
+	DB	UH2
+	DB	N
+	DB	'@'
+	DB	'O>ST!='
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'OF>^='
+	DB	AW
+	DB	F
+	DB	'@'
+	DB	'OTHER='
+	DB	UH
+	DB	THV
+	DB	ER
+	DB	'@'
+	DB	'OSS>!='
+	DB	AW
+	DB	S
+	DB	'@'
+	DB	'OM<^:#='
+	DB	UH
+	DB	MM
+	DB	'@'
+	DB	'O='
+	DB	AH
+	DB	'@['
+PRULES:
+	DB	'P<!>!='
+	DB	PP
+	DB	E1
+	DB	Y
+	DB	'@'
+	DB	'PH='
+	DB	F
+	DB	'@'
+	DB	'PEOP='
+	DB	PP
+	DB	EE
+	DB	PP
+	DB	'@'
+	DB	'POW='
+	DB	PP
+	DB	AH
+	DB	O1
+	DB	'@'
+	DB	'PUT>!='
+	DB	PP
+	DB	OO
+	DB	T
+	DB	'@'
+	DB	'P='
+	DB	PP
+	DB	'@['
+QRULES:
+	DB	'Q<!>!='
+	DB	K
+	DB	Y1
+	DB	IU
+	DB	U1
+	DB	U1
+	DB	'@'
+	DB	'QUAR='
+	DB	K
+	DB	W
+	DB	O
+	DB	RR
+	DB	'@'
+	DB	'QU='
+	DB	K
+	DB	W
+	DB	'@'
+	DB	'Q='
+	DB	K
+	DB	'@['
+RRULES:
+	DB	'R<!>!='
+	DB	AH1
+	DB	UH2
+	DB	RR
+	DB	'@'
+	DB	'RE<!>^#='
+	DB	RR
+	DB	EE
+	DB	'@'
+	DB	'RING=',RR,I2,NG
+	DB	'RI=',RR,AH1,EH3,I3,Y,'@'
+	DB	'R='
+	DB	RR
+	DB	'@['
+SRULES:
+	DB	'S<!>!='
+	DB	EH1
+	DB	EH2
+	DB	S
+	DB	'@'
+	DB	'SH='
+	DB	SH
+	DB	'@'
+	DB	'SION<#='
+	DB	ZH
+	DB	UH2
+	DB	N
+	DB	'@'
+	DB	'SOME='
+	DB	S
+	DB	UH
+	DB	MM
+	DB	'@'
+	DB	'SUR<#>#='
+	DB	ZH
+	DB	ER
+	DB	'@'
+	DB	'SUR>#='
+	DB	SH
+	DB	ER
+	DB	'@'
+	DB	'SU<#>#='
+	DB	ZH
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'SSU<#>#='
+	DB	SH
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'SED<#>!='
+	DB	ZZ
+	DB	DD
+	DB	'@'
+	DB	'S<#>#='
+	DB	ZZ
+	DB	'@'
+	DB	'SAID='
+	DB	S
+	DB	EH
+	DB	DD
+	DB	'@'
+	DB	'SION<^='
+	DB	SH
+	DB	UH2
+	DB	N
+	DB	'@'
+	DB	'S>S='
+	DB	'@'
+	DB	'S<.>!='
+	DB	ZZ
+	DB	'@'
+	DB	'S<E.:#>!='
+	DB	ZZ
+	DB	'@'
+	DB	'S<E.:#>!='
+	DB	ZZ
+	DB	'@'
+	DB	'S<##^:#>!='
+	DB	ZZ
+	DB	'@'
+	DB	'S<U>!='
+	DB	S
+	DB	'@'
+	DB	'S<#:!>!='
+	DB	ZZ
+	DB	'@'
+	DB	'SCH<!='
+	DB	S
+	DB	K
+	DB	'@'
+	DB	'S>C+='
+	DB	'@'
+	DB	'SM<#='
+	DB	ZZ
+	DB	MM
+	DB	'@'
+	DB	'SN<#>''='
+	DB	ZZ
+	DB	UH2
+	DB	N
+	DB	'@'
+	DB	'S='
+	DB	S
+	DB	'@['
+TRULES:
+	DB	'T<!>!='
+	DB	T
+	DB	E1,AY
+	DB	Y
+	DB	'@'
+	DB	'THE<!>!='
+	DB	THV
+	DB	UH2
+	DB	'@'
+	DB	'TO>!='
+	DB	T
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'THAT>!='
+	DB	THV
+	DB	AE1
+	DB	EH3
+	DB	T
+	DB	'@'
+	DB	'THIS<!>!='
+	DB	THV
+	DB	II
+	DB	S
+	DB	'@'
+	DB	'THEY<!='
+	DB	THV
+	DB	AA
+	DB	AY
+	DB	'@'
+	DB	'THERE<!='
+	DB	THV
+	DB	EH
+	DB	RR
+	DB	'@'
+	DB	'THER='
+	DB	THV
+	DB	ER
+	DB	'@'
+	DB	'THEIR='
+	DB	THV
+	DB	EH
+	DB	A2
+	DB	'@'
+	DB	'THAN<!>!='
+	DB	THV
+	DB	AE
+	DB	N
+	DB	'@'
+	DB	'THEM<!>!='
+	DB	THV
+	DB	EH
+	DB	MM
+	DB	'@'
+	DB	'THESE>!='
+	DB	THV
+	DB	EE
+	DB	ZZ
+	DB	'@'
+	DB	'THEN<!='
+	DB	THV
+	DB	EH
+	DB	N
+	DB	'@'
+	DB	'THROUGH>!='
+	DB	TH
+	DB	RR
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'THOSE='
+	DB	THV
+	DB	O1
+	DB	U1
+	DB	ZZ
+	DB	'@'
+	DB	'THOUGH>!='
+	DB	THV
+	DB	O1
+	DB	U1
+	DB	'@'
+	DB	'THUS<!='
+	DB	THV
+	DB	UH,S
+	DB	'@'
+	DB	'TH='
+	DB	TH
+	DB	'@'
+	DB	'TED<:#>!='
+	DB	T
+	DB	II
+	DB	DD
+	DB	'@'
+	DB	'TI<S>#N='
+	DB	T
+	DB	CH
+	DB	'@'
+	DB	'TI>O='
+	DB	SH
+	DB	'@'
+	DB	'TI>A='
+	DB	SH
+	DB	'@'
+	DB	'TIEN='
+	DB	SH
+	DB	UH2
+	DB	N
+	DB	'@'
+	DB	'TUR>#='
+	DB	T
+	DB	CH
+	DB	ER
+	DB	'@'
+	DB	'TU>A='
+	DB	T
+	DB	CH
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'TWO<!='
+	DB	T
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'T='
+	DB	T
+	DB	'@['
+URULES:
+	DB	'U<!>!='
+	DB	Y1
+	DB	IU
+	DB	U1
+	DB	U1
+	DB	'@'
+	DB	'UN<!>I='
+	DB	Y
+	DB	IU
+	DB	U
+	DB	N
+	DB	'@'
+	DB	'UN<!='
+	DB	UH
+	DB	N
+	DB	'@'
+	DB	'UPON<!='
+	DB	UH
+	DB	PP
+	DB	AW
+	DB	N
+	DB	'@'
+	DB	'UR<$>#='
+	DB	OO
+	DB	RR
+	DB	'@'
+	DB	'UR>#='
+	DB	Y
+	DB	OO
+	DB	RR
+	DB	'@'
+	DB	'UR=',ER,'@'
+	DB	'US>!=',UH1,UH2,S,'@'
+	DB	'UE<^>!=',IU,U1,U1
+	DB	'U>^!='
+	DB	UH
+	DB	'@'
+	DB	'U>^^='
+	DB	UH
+	DB	'@'
+	DB	'UY='
+	DB	AH1
+	DB	EH3
+	DB	E1
+	DB	'@'
+	DB	'U<G!>#='
+	DB	'@'
+	DB	'U<G>%='
+	DB	'@'
+	DB	'U<N#='
+	DB	Y
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'U<$='
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'U='
+	DB	Y
+	DB	IU
+	DB	U
+	DB	'@'
+VRULES:
+	DB	'V<!>!='
+	DB	V
+	DB	E1
+	DB	AY
+	DB	Y
+	DB	'@'
+	DB	'VIEW='
+	DB	V
+	DB	Y
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'VERI<!=',V,EH1,RR,I3,'@'
+	DB	'VE=',V,'@'
+	DB	'VAL<!=',V,AE1,EH3,LL,'@'
+	DB	'V='
+	DB	V
+	DB	'@['
+WRULES:
+	DB	'W<!>!='
+	DB	DD
+	DB	UH1
+	DB	BB
+	DB	UH3
+	DB	LL
+	DB	Y1
+	DB	U1
+	DB	'@'
+	DB	'WERE<!='
+	DB	W
+	DB	ER
+	DB	'@'
+	DB	'WA>S='
+	DB	W
+	DB	AH
+	DB	'@'
+	DB	'WA>T='
+	DB	W
+	DB	AH
+	DB	'@'
+	DB	'WHERE='
+	DB	HH
+	DB	W
+	DB	EH
+	DB	RR
+	DB	'@'
+	DB	'WHAT='
+	DB	HH
+	DB	W
+	DB	UH3,UH1
+	DB	T
+	DB	'@'
+	DB	'WHOL='
+	DB	HH
+	DB	O1
+	DB	U1
+	DB	LL
+	DB	'@'
+	DB	'WHO='
+	DB	HH
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'WH='
+	DB	HH
+	DB	W
+	DB	'@'
+	DB	'WAR='
+	DB	W
+	DB	O
+	DB	RR
+	DB	'@'
+	DB	'WOR>^='
+	DB	W
+	DB	ER
+	DB	'@'
+	DB	'WR='
+	DB	RR
+	DB	'@'
+	DB	'W='
+	DB	W
+	DB	'@['
+XRULES:
+	DB	'X<!>!='
+	DB	EH1
+	DB	EH2
+	DB	K
+	DB	PA0
+	DB	S
+	DB	'@'
+	DB	'X<!='
+	DB	ZZ
+	DB	'@'
+	DB	'X='
+	DB	K
+	DB	S
+	DB	'@['
+YRULES:
+	DB	'Y<!>!='
+	DB	W
+	DB	AH1
+	DB	EH3
+	DB	I3
+	DB	Y
+	DB	'@'
+	DB	'YOUNG='
+	DB	Y
+	DB	UH
+	DB	NG
+	DB	'@'
+	DB	'YOU<!='
+	DB	Y
+	DB	IU
+	DB	U
+	DB	'@'
+	DB	'YES<!='
+	DB	Y
+	DB	EH
+	DB	S
+	DB	'@'
+	DB	'Y<!='
+	DB	Y
+	DB	'@'
+	DB	'Y<^:#>!='
+	DB	EE
+	DB	'@'
+	DB	'Y<^:#>I='
+	DB	EE
+	DB	'@'
+	DB	'Y<:!>!='
+	DB	AH
+	DB	E1
+	DB	'@'
+	DB	'Y<:!>#='
+	DB	AH
+	DB	E1
+	DB	'@'
+	DB	'Y<:!>^+:#='
+	DB	II
+	DB	'@'
+	DB	'Y<:!>^#='
+	DB	AH
+	DB	E1
+	DB	'@'
+	DB	'Y='
+	DB	II
+	DB	'@['
+ZRULES:
+	DB	'Z<!>!='
+	DB	ZZ
+	DB	EE
+	DB	DD	; CANADIAN
+	DB	'@'
+	DB	'Z='
+	DB	ZZ
+	DB	'@['
+NUMBRULES:
+RULE0:	DB	'0='
+	DB	ZZ
+	DB	II
+	DB	RR
+	DB	UH3
+	DB	O1
+	DB	'@['
+RULE1:	DB	'1='
+	DB	W
+	DB	UH
+	DB	N
+	DB	'@['
+RULE2:	DB	'2='
+	DB	T
+	DB	IU
+	DB	U
+	DB	'@['
+RULE3:	DB	'3='
+	DB	TH
+	DB	RR
+	DB	E1
+	DB	Y
+	DB	'@['
+RULE4:	DB	'4='
+	DB	F
+	DB	O1
+	DB	U1
+	DB	RR
+	DB	'@['
+RULE5:	DB	'5='
+	DB	F
+	DB	UH3
+	DB	AH1
+	DB	E1
+	DB	V
+	DB	'@['
+RULE6:	DB	'6='
+	DB	S
+	DB	II
+	DB	K
+	DB	S
+	DB	'@['
+RULE7:	DB	'7='
+	DB	S
+	DB	EH1
+	DB	V
+	DB	EH3
+	DB	N
+	DB	'@['
+RULE8:	DB	'8='
+	DB	AA
+	DB	AY
+	DB	T
+	DB	'@['
+RULE9:	DB	'9='
+	DB	N
+	DB	AH1
+	DB	I3
+	DB	Y
+	DB	N
+	DB	'@['
+	DB	'@'
+BLANK:	DB	' =',PA0,'@['
+MINUS:	DB	'-=',MM,AH1,Y,N,EH3,S,'@['
+APOST:	DB	39,'<!>!='
+	DB	PA0,'@'
+	DB	39,'S<!='
+	DB	II,ZZ,'@'
+	DB	39,'S<!.='
+	DB	ZZ,'@'
+	DB	39,'S<E.:#='
+	DB	ZZ,'@'
+	DB	39,'S<!#='
+	DB	ZZ,'@'
+	DB	39,' ='
+	DB	PA0,'@['
+COMMA:	DB	',=',PA1,'@['
+PERIOD:	DB	'.='
+	DB	PA1,'@['
+QUEST:	DB	'?='
+	DB	PA1,'@['
+COLON:	DB	';='
+	DB	PA0
+	DB	'@['
+SEMICO:	DB	':=',PA0,'@['
+PLUS:	DB	'+=',PP,LL,UH1,UH2,S,'@['
+EQUALS:	DB	'==',Y,K,W,UH3,LL,ZZ,'@['
+MULT:	DB	'*=',T,AH1,EH3,Y,MM,ZZ,'@['
+DIVIDE:	DB	'/=',DD,I1,V,AH1,EH3,Y,DD,I2,DD,BB,AH1,EH3,I3,Y,'@['
+TOTHE:	DB	'^=',T,IU,U1,THV,UH1,UH3,'@['
+LTHAN:	DB	'<=',LL,EH1,EH3,S,THV,EH1,EH3,N,'@['
+GTHAN:	DB	'>=',G,RR,A1,Y,T,ER,THV,EH1,EH3,N,'@['
+EXCLA:	DB	'!=',PA0,'@['
+QUOTE:	DB	'"=',PA0,'@['
+DOLLAR:	DB	'$=',DD,AH1,UH3,LL,ER,'@['
+PERCNT:	DB	'%=',PP,ER,S,EH1,EH3,N,Y,'@['
+LBRACK:	DB	')=',PA0,'@['
+RBRACK:	DB	'(=',PA0,'@['
+ATSYM:	DB	'@=',PA0,'@['
+ANDD:	DB	'&=',AE1,EH3,N,DD,'@['
+
+	END
+
+	

@@ -1,0 +1,103 @@
+.comment\
+**************************************************************
+*
+* Keyboard Translation tables for SBCMON.MAC
+*
+*	(Rob's Retro Computing Archive)
+*	RetroComputingArchive@gmail.com
+*	https://github.com/rcl9
+*
+**************************************************************\
+
+; December 22, 1985.
+
+public	keypad$table
+public	on$caps$table
+public	off$caps$table
+public	off$shft$caps
+public	on$shft$caps
+public	control$table
+public 	tv$key
+
+		.z80
+
+eot		equ	004h
+cr		equ	00dh
+lf		equ	00ah
+bs		equ	008h
+esc		equ	01bh
+tab		equ	009h
+left$cursor	equ	080h
+right$cursor	equ	081h
+up$cursor	equ	082h
+down$cursor	equ	083h
+cc$left		equ	07fh	; '<<||' cursor key
+cc$right	equ	085h	; '||>>' cursor key
+sym$left	equ	086h
+sym$right	equ	087h
+end$key		equ	088h
+tv$key		equ	089h
+go$key		equ	08ah
+yes$key		equ	08bh
+no$key		equ	08ch
+help$key	equ	08dh
+
+return$key	equ	0dh
+space$bar	equ	020h
+
+keypad$table:	defb	'A','7','4','1',return$key
+		defb	'B','8','5','2','0'
+		defb	'C','9','6','3','.'
+		defb	'D','E','F','+','-'
+
+on$caps$table:	defb	'1','3','5','7','9','-',esc,yes$key
+		defb	'Q','E','T','U','O','[',tab,left$cursor
+		defb	'A','D','G','J','L',39,sym$left,up$cursor
+		defb	'Z','C','B','M','.',' ',end$key,cc$left
+		defb	'2','4','6','8','0','=',tv$key,no$key
+		defb	'W','R','Y','I','P',help$key,go$key,right$cursor
+		defb	'S','F','H','K',';',return$key,space$bar,down$cursor
+		defb	'X','V','N',',','/',sym$right,' ',cc$right
+
+off$caps$table:	defb	'1','3','5','7','9','-',esc,yes$key
+		defb	'q','e','t','u','o','[',tab,left$cursor
+		defb	'a','d','g','j','l',39,sym$left,up$cursor
+		defb	'z','c','b','m','.',' ',end$key,cc$left
+		defb	'2','4','6','8','0','=',tv$key,no$key
+		defb	'w','r','y','i','p',help$key,go$key,right$cursor
+		defb	's','f','h','k',';',return$key,space$bar,down$cursor
+		defb	'x','v','n',',','/',sym$right,' ',cc$right
+
+
+off$shft$caps:	defb	'!','#','%','&','(','_',esc,yes$key
+		defb	'Q','E','T','U','O','[',tab,left$cursor
+		defb	'A','D','G','J','L',34,sym$left,up$cursor
+		defb	'Z','C','B','M','>',' ',end$key,cc$left
+		defb	'@','$','^','*',')','+',tv$key,no$key
+		defb	'W','R','Y','I','P',help$key,go$key,right$cursor
+		defb	'S','F','H','K',':',return$key,space$bar,down$cursor
+		defb	'X','V','N','<','?',sym$right,' ',cc$right
+
+
+on$shft$caps: 	defb	'!','#','%','&','(','_',esc,yes$key
+		defb	'q','e','t','u','o',']',tab,left$cursor
+		defb	'a','d','g','j','l',34,sym$left,up$cursor
+		defb	'z','c','b','m','>',' ',end$key,cc$left
+		defb	'@','$','^','*',')','+',tv$key,no$key
+		defb	'w','r','y','i','p',help$key,go$key,right$cursor
+		defb	's','f','h','k',':',return$key,space$bar,down$cursor
+		defb	'x','v','n','<','?',sym$right,' ',cc$right
+
+; layout is the same as on the Sorcerer.
+
+control$table:	defb	0,0,0,0,0,31,esc,yes$key
+		defb	17,5,20,21,15,29,tab,left$cursor
+		defb	1,4,7,10,12,0,sym$left,up$cursor
+		defb	26,3,2,13,0,0,end$key,cc$left
+		defb	0,0,0,0,0,30,tv$key,no$key
+		defb	23,18,25,9,16,help$key,go$key,right$cursor
+		defb	19,6,8,11,0,0,0,down$cursor
+		defb	24,22,14,0,0,sym$right,0,cc$right
+
+		end
+

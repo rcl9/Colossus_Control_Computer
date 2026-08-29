@@ -1,0 +1,213 @@
+.comment\
+**************************************************************
+*
+* These are the old, unused music synthesizer routines.
+* An external interrupt from the CTC caused the interrupt service routine 
+* to output a waveform sample and an envelope sample to the two 
+* Dacs (one for the waveform, one for ampplitude scaling).
+*
+* This was taken from the much older sbcmon.001 (version # 1.1)
+*
+*
+*	(Rob's Retro Computing Archive)
+*	RetroComputingArchive@gmail.com
+*	https://github.com/rcl9
+*
+**************************************************************
+
+ =-=-=-=-=-=-=-=-=-=- Music Synth.-=-=-=-=-=-=-=-=-=-=-
+
+Register values:
+
+DE = waveform data location
+HL = amplitude data location
+
+Wave table has to start on even page boundary
+
+Apply 2mhz signal to CLK2/TRG
+\
+
+wave	 equ	1000h	; start of 128 byte wave table
+env1     equ	1200h	; start of envelope table
+env2	 equ	1500h	; start of second envelope table
+
+prg1	equ	$
+	.phase 2000h
+prg2:
+
+; enter here to start wait loop (do nothing, but set up registers)
+
+looper:	jp	looper		; wait for interrupts
+
+; total = 54 T states = 13.5us (+7 T cycles for INT ACK)
+
+sendwave:di				; (4)
+	ld	a,(de)			; (7)
+	inc	de			; (6)
+	res	7,e			; (8)
+	out	(pa$data),a		; (11)
+	ei				; (4)
+	reti				; (14)
+
+; Envelope generator, clocked by external CTC interrupt.
+; Main loop = 60 T cycles = 15us
+; At 500 hz, this is called once every 133 executions of
+;   above tone generation routine.
+
+sendamp:
+	di			; (4)
+	ld	a,(hl)		; (7)
+	inc	hl		; (6)
+	out	(pb$data),a	; (11)
+	cp	00		; (7)
+	jr	z,stop$amp	; (7/12)
+	ei			; (4)
+	reti			; (14)
+
+; turn off amplitude generation by stopping interrupts
+
+stop$amp:
+	ld	a,3
+	out	(ctc$c),a		; disable CTC chan 2
+	out	(ctc$d),a
+	ei
+	reti
+
+; keyboard driver routine - nmi servicer
+
+driver: ld	a,0
+	out	(pb$data),a	; zero amplitude
+	ld	a,40h		; select read fifo command
+	out	(key$ctrl),a
+	in	a,(key$data)	; get keyboard data
+	and	03fh		; mask off cntrl & shift bits
+	push	af
+	and	00111000b	; keep column bits
+	srl	a		; make A 0-3
+	srl	a
+	srl	a
+	ex	af,af'
+	pop	af
+	and	00000111b	; save row bits
+	ld	b,a
+	cp	0		; are we in row 1?
+	jr	nz,exaf		; no, go compute which row
+
+	ex	af,af'		; else, af = key offset
+	jr	doneadd
+
+exaf:	ex	af,af'
+
+addb:	add	a,4		; compute offset
+	djnz	addb
+
+; A will have 0-15 in it now (key offset)
+
+doneadd: ld	e,a
+	ld	d,0
+	ld	hl,freq$table
+	add	hl,de
+	ld	a,(hl)		; get time constant
+	push	af
+
+; program ctc to interrupt computer at 422hz to put
+; out envelope
+
+	in	a,(switches)
+	and	020H
+	or	a
+	jr	nz,penv2
+	ld	hl,env1+1
+	jr	penv3
+
+penv2:	ld	hl,env2+1	; set hl to envelope table
+
+penv3:	in	a,(switches)
+	and	040H
+	or	a
+	jr	nz,other
+	ld	de,wave
+	jr	cont
+
+other:	ld	de,wave+0100H
+
+cont:	ld	a,027h
+	ld	i,a
+	im	2
+
+	ld	a,0e0h		; send int. vector to ctc$a port
+	out	(ctc$a),a
+
+	ld	a,3
+	out	(ctc$d),a	; reset channel 3
+	ld	a,10110101b	; give time constant
+	out	(ctc$d),a	; program channel 3
+	ld	a,010H		; select 214 hz
+	out	(ctc$d),a
+
+
+	ld	a,3
+	out	(ctc$c),a	; reset channel 2
+	ld	a,11110101b	; give time constant
+				; enable ints, counter mode
+	out	(ctc$c),a		; program channel 2
+	pop	af		; select piano freq.
+	out	(ctc$c),a
+rtn:	ei			; **** this must be left here!
+	reti
+
+; freq time constant table
+
+freq$table	equ	$
+
+; time constant = 2e6/sam.rate
+
+;		divisor  note  freq   sam.rate  freq error
+
+
+	defb	119	; C3 - 130.8 - 16806.7
+	defb	113	; C# - 138.6 - 17699.1
+	defb	106	; D  - 146.8 - 18867.9
+	defb	100	; D# - 155.6 - 20000.0
+	defb	95	; E  - 164.8 - 21052.6
+	defb	88	; F  - 176.6 - 22727.2
+	defb	85	; F# - 184.5 - 23529.4
+	defb	80	; G  - 196.0 - 25000.0
+	defb	75	; G# - 207.7 - 26666.7
+	defb	71	; A  - 220.0 - 28169.0
+	defb	67	; A# - 233.0 - 29850.7
+	defb	63	; B  - 246.9 - 31746.0
+	defb	60	; C4 - 261.6 - 33484.8  (+1.2)
+	defb	56	; C# - 277.2 - 35481.6  (+1.8)
+	defb	53	; D  - 293.7 - 37593.6  (+1.1)
+	defb	50	; D# - 311.12- 39823.36 (+1.4)
+	defb	47	; E  - 329.6 - 42188.8  (+2.8)
+	defb	45	; F  - 349.2 - 44697.6  (-1.9)
+	defb	42	; F# - 370.0 - 47360.0  (+2.0)
+	defb	40	; G  - 392.0 - 50176.0  (-1.4)
+
+; old waveform table (not enough speed past first 8 notes) 
+
+
+	defb	60	; C4 - 261.6 - 33484.8  (+1.2)
+	defb	56	; C# - 277.2 - 35481.6  (+1.8)
+	defb	53	; D  - 293.7 - 37593.6  (+1.1)
+	defb	50	; D# - 311.12- 39823.36 (+1.4)
+	defb	47	; E  - 329.6 - 42188.8  (+2.8)
+	defb	45	; F  - 349.2 - 44697.6  (-1.9)
+	defb	42	; F# - 370.0 - 47360.0  (+2.0)
+	defb	40	; G  - 392.0 - 50176.0  (-1.4)
+	defb	38	; G# - 415.3 - 53158.4  (-4.1)
+	defb	36	; A  - 440   - 56320.0  (-6.0)
+	defb	34	; A# - 466.1 - 59660.8  (-6.5)
+	defb	32	; B  - 493.9 - 63219.2  (-5.6)
+	defb	30	; C5 - 523.3 - 66982.4  (-2.5)
+
+endprg	equ	$-prg2
+
+	.dephase
+
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+	end
+

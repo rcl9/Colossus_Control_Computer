@@ -1,0 +1,125 @@
+module decode1
+title 'I/O Decode and Static Ram Chip Select for Colossus Computer
+	By RCL9. November 14, 1988'
+
+"	ZZ4	device		'E0310';
+	ZZ4	device		'P16L8';
+
+" Sram is 8k. 4k is permanently addressed from F000-FFFF. The other
+" 4k can be accessed by switching into the rom bank and accessing
+" E000 through EFFF. If in Ram mode (not rom bank), then 0000 
+" through EFFF accesses the current Dynamic ram bank.
+
+	"---->>> Inputs
+
+	A12, A13, A14, A15		pin	1, 2, 3, 4;	
+	!IO_WR, !IO_RD			pin	5, 6;
+	A4, A5, A6			pin	7, 8, 9;	
+	Ram_Rom				pin	11;		" Low for Rom
+
+	"---->>> Outputs
+
+	Ports_0_F,   Ports_10_1F 	pin	19, 18;
+	Ports_20_2F, Ports_30_3F	pin	17, 16;
+	Ports_40_4F, Ports_50_5F	pin	15, 14;
+	Ram_CS				pin	13;
+	Dram_Addr			pin	12;
+
+	H, L, X				= 1, 0, .X.;
+
+	"Decode memory address on 4k boundaries
+	Mem_Addr = [A15, A14, A13, A12,X,X,X,X,X,X,X,X,X,X,X,X];
+
+	"Note: I/O Ports 0x80 to 0xff are not decoded (not enough pins)
+	Port_Addr = [X, A6, A5, A4, X, X, X, X];
+
+equations
+
+	!Ports_0_F = 	(Port_Addr == 00) & (IO_WR)
+			# (Port_Addr == 00) & (IO_RD);
+
+	!Ports_10_1F = 	(Port_Addr == ^h10) & (IO_WR)
+			# (Port_Addr == ^h10) & (IO_RD);
+
+	!Ports_20_2F = 	(Port_Addr == ^h20) & (IO_WR)
+			# (Port_Addr == ^h20) & (IO_RD);
+
+	!Ports_30_3F = 	(Port_Addr == ^h30) & (IO_WR)
+			# (Port_Addr == ^h30) & (IO_RD);
+
+	!Ports_40_4F = 	(Port_Addr == ^h40) & (IO_WR)
+			# (Port_Addr == ^h40) & (IO_RD);
+
+	!Ports_50_5F = 	(Port_Addr == ^h50) & (IO_WR)
+			# (Port_Addr == ^h50) & (IO_RD);
+
+	"Address on bus is between F000 and FFFF, or between 
+	"E000 and EFFF and the rom bank is selected.
+	!Ram_CS	= 	(Mem_Addr >= ^hf000) & (Mem_Addr <= ^hffff)
+			# (Mem_Addr >= ^he000) & (Mem_Addr <= ^hefff) & (!Ram_Rom);
+
+	"Address on bus is between 0000 and EFFF, and the rom bank is not selected
+	!Dram_Addr = 	(Mem_Addr >= 0000) & (Mem_Addr <= ^hefff) & (Ram_Rom);
+
+test_vectors	" Test address decode first
+
+" Ram_Rom high for ram mode
+([Mem_Addr,	Ram_Rom]  	-> 	[    Ram_CS, Dram_Addr  ])
+
+"Access permanently visible Sram at F000 in Ram or Rom mode
+[^hf000,	X	]	->	[ 	L,	H	];
+[^hf800,	X	]	->	[ 	L,	H	];
+
+"Try to access Lower half of Sram in Ram mode (shouldn't be visible)
+[^he000,	H	]	->	[ 	H,	L	];
+[^he800,	H	]	->	[ 	H,	L	];
+
+"Try to access Lower half of Sram in Rom mode (should be visible)
+[^he000,	L	]	->	[ 	L,	H	];
+[^he800,	L	]	->	[ 	L,	H	];
+
+"Do an access to Dram. Sram should not be enabled
+[^h1000,	H	]	->	[ 	H,	L	];
+[^h9000,	H	]	->	[ 	H,	L	];
+
+" Do an access to Eprom and Cartridge I/O space. Sram not enabled.
+[^h1000,	L	]	->	[ 	H,	H	];
+[^h9000,	L	]	->	[ 	H,	H	];
+
+
+test_vectors	" Test the I/O Port Decode
+
+([Port_Addr,	!IO_WR,	!IO_RD]	  -> [	Ports_0_F, Ports_10_1F, Ports_20_2F, 
+					Ports_30_3F, Ports_40_4F, Ports_50_5F ])
+
+" Test each port for a read, write and no action
+[^h00,		H,	H	] -> [	H, H, H, H, H, H  ];
+[^h00,		L,	H	] -> [	L, H, H, H, H, H  ];
+[^h00,		H,	L	] -> [	L, H, H, H, H, H  ];
+
+[^h10,		H,	H	] -> [	H, H, H, H, H, H  ];
+[^h10,		L,	H	] -> [	H, L, H, H, H, H  ];
+[^h10,		H,	L	] -> [	H, L, H, H, H, H  ];
+
+[^h20,		H,	H	] -> [	H, H, H, H, H, H  ];
+[^h20,		L,	H	] -> [	H, H, L, H, H, H  ];
+[^h20,		H,	L	] -> [	H, H, L, H, H, H  ];
+
+[^h30,		H,	H	] -> [	H, H, H, H, H, H  ];
+[^h30,		L,	H	] -> [	H, H, H, L, H, H  ];
+[^h30,		H,	L	] -> [	H, H, H, L, H, H  ];
+
+[^h40,		H,	H	] -> [	H, H, H, H, H, H  ];
+[^h40,		L,	H	] -> [	H, H, H, H, L, H  ];
+[^h40,		H,	L	] -> [	H, H, H, H, L, H  ];
+
+[^h50,		H,	H	] -> [	H, H, H, H, H, H  ];
+[^h50,		L,	H	] -> [	H, H, H, H, H, L  ];
+[^h50,		H,	L	] -> [	H, H, H, H, H, L  ];
+
+"And should that 0x80 to 0xff is not decoded
+[^h80,		H,	H	] -> [	H, H, H, H, H, H  ];
+[^h80,		L,	H	] -> [	L, H, H, H, H, H  ];
+[^h80,		H,	L	] -> [	L, H, H, H, H, H  ];
+
+end decode1

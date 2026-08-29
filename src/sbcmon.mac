@@ -1,0 +1,4627 @@
+.comment\
+**************************************************************
+*
+* 	Z80 Control Monitor For Colossus Control Computer
+* 		05/29/2026 - Version 2.5
+*
+* By RCL9
+*	(Rob's Retro Computing Archive)
+*	RetroComputingArchive@gmail.com
+*	github.com/rcl9
+*
+**************************************************************
+
+2.5     (05/29/2026)
+	Added various "Colossus" ASCII banners at start-up to choose from
+	Added 'pr$string$rs232' to force output to RS-232 port and not the LCD.
+	Added progress messages to the RS-232 port during start-up.
+	Added time-outs in the LCD and Votrax modules.
+	Added a test/demo of all the LED driver routines.
+	Added the "heart beat" LED on the main board. If this light is flashing then
+		the board is alive and the main character input loop is running.
+
+2.4	(03/12/87)
+	Moved Keyboard NMI to Sio-SyncA line instead.
+	Added Votrax Speach Synthesizer driver and tables.
+	Added Lcd driver.
+
+2.3	(02/27/87)
+	Took bug out of RST$IO$DRIVER, ld a,b/ld b,a instead of push/pop af
+	Put hooks in for LCD.MAC driver written for pmon.mac.
+
+2.2	(02/14/87)
+	Added disk I/O and made compatible with Cypher's monitor roms.
+	Deleted all the RST vectors - use vector table in static ram now.
+	Added Centronics parallel port driver.
+	Added Rs-232, Midi and Centronics vector entry point drivers.
+
+2.1	(10/03/86)
+	Made it compile with Z80ASM.COM & L80.COM
+
+2.0	(01/08/86)
+	Added real time clock driver
+
+1.9 	(12/22/85)
+	Made simon game an external file
+	Made keyboard definition tables external
+	Added Midi and RS-232 Transmit Interrupts
+
+1.8	(11/29/85)
+	Added Auxiliary board equates
+	Wrote Simon game for Universal I/O Port
+	Added Auxiliary board initializations
+	Wrote Keyboard and Keypad driver
+	Wrote LED driver
+	Wrote LCD driver
+
+1.7	(11/14/85)
+	Added drum pad dispatching software
+
+1.6	(11/06/85)
+	Added PIO interrupt handler for drum pad inputs
+
+1.5	(10/11/85)
+	Added Midi sub-menu and xmodem capability
+
+1.4	(09/14/85)
+	Started work on Keyboard Interrupt driver.
+	Setup LED display parameters
+
+1.3     (09/09/85)
+	Added interrupt & buffering routines to SIO (Midi + RS-232)
+
+1.2	(09/01/85)
+	Got rid of music synthesizer software
+	Converted to new hardware memory map.
+	Coverted SIO I/O to 8253 timer.
+	Programmed SIO Channel B for Midi (no interrupts yet).
+
+1.1	(04/??/85)
+	Converted to music synth. (piano using 2 DACS)
+
+1.0	(03/12/85)
+	Initial version for hardware debugging.		\
+
+extrn	votrax		; entry point to text to english converter
+extrn	speak		; entry point to speak a line of text at (SP)
+extrn	sc01$init	; initialization routines for votrax chip
+extrn	send$sc01	; send A to Votrax speech chip
+extrn	xmodem		; entry point to xmodem send/receive
+extrn	play$simon	; entry point to simon game
+extrn	lcd$table	; lcd function address jump table
+extrn	test$lcd$display ; test the LCD display
+extrn	testa 	; test the LCD display
+extrn	testb 	; test the LCD display
+
+include PUBLICS.MAC
+
+;	------ Conditional Compilation------
+
+true	equ	0ffffh
+false	equ	not true
+yes	equ	true
+no	equ	false
+eot	equ	04h
+cr	equ	0dh
+lf	equ	0ah
+bs	equ	08h
+esc	equ	01bh
+tab	equ	09h
+
+.comment\
+		     -------------------
+                     Colossus Memory Map
+		     -------------------
+
+f000-ffff	4K of static RAM
+
+fff0-ffff	Special monitor jump table
+	        Midi receive error flag
+ffd0-ffef	CTC, PIO, NMI, SIO interrupt vectors
+ffb0-ffcf	Temporary stack for BSWTCH routine
+ff00-ffaf	Monitor stack area
+ff00-ff7f	Default dma disk buffer (dbuf)
+fd00-feff	Monitor data variables, input buffers etc (top at 0fed0h at last check)
+fc00-fcff	256 Byte Midi Input buffer
+f9e0-fbff	Common sram disk and bank switch routines      \
+
+;		---- Flag Equates ----
+
+; the next two are used by the MIDI$RECEIVE$ERROR flag
+
+buffer$overrun$error	equ	1	; Midi input buffer has over-flowed
+rec$overrun$error	equ	2	; Midi SIO input has overran
+
+
+;		---- variables used in the monitor ----
+
+mem$bot	equ	0f000h
+mem$top	equ	0ffffh		; only 4k of static ram
+beprom	equ	0feh		; eprom bank (its really a bit flag, but this
+				; value is used for compatibility with Cypher monitor)
+dbuf	equ	mem$top - 0ffh	; default dma buffer
+sram	equ	0f9e0h		; start of the common sram disk and bank switch routines
+
+;       	---- Static memory data variables ----
+
+mwa$length	equ	0200h	; 512 bytes long
+
+midi$input$buffer	equ	mem$top - 03ffh	; 255 byte Midi Input buffer
+midi$q$length		equ	0ffh	; receive queue length
+midi$send$q$length	equ	40h	; send queue length
+
+rs232$q$length		equ	20	; 20 bytes for Serial input buffer
+rs232$send$q$length	equ	20	; serial output buffer
+
+mwa	equ	mem$top - 2ffh
+
+spsave	equ	mwa			; stack pointer save for BSWTCH routine
+thl	equ	spsave + 2		; register HL save for BSWTCH routine
+ta	equ	thl + 2			; register A save for BSWTCH routine
+
+density equ	ta + 1			; density of disk
+side	equ	density + 1		; next disk access side
+speed	equ	side + 1		; seek speed for disk i/o
+secsz	equ	speed + 1		; sector size for next disk access
+dmadr	equ	secsz + 2		; default dma buffer address
+trktab	equ	dmadr + 2		; table of drive head positions
+diskno	equ	trktab + 2		; current drive
+trackno	equ	diskno + 1		; current track
+sectno	equ	trackno + 1		; current sector
+retryno	equ	sectno + 1		; retry counter
+errorst	equ	retryno + 1		; error status
+
+param1	equ	errorst + 1		; monitor command parameters
+param2	equ	param1 + 2
+param3	equ	param2 + 2
+last	equ	param3 + 2		; last address used by mem dump
+escflg	equ	last + 2		; console escape flag
+linbuf	equ	escflg + 1		; console input line buffer
+
+rs232$input$buffer 	equ	linbuf + 80h
+rs232$q$start		equ	rs232$input$buffer + rs232$q$length ; word pointer
+rs232$q$end		equ	rs232$q$start + 2 ; queue end pointer
+rs232$bytes$in$q 	equ	rs232$q$end + 2	; how many bytes that are in the queue
+
+midi$q$start		equ	rs232$bytes$in$q + 1 ; word pointer
+midi$q$end		equ	midi$q$start + 2 ; queue end pointer
+midi$bytes$in$q 	equ	midi$q$end + 2	; how many bytes that are in the queue
+midi$receive$error 	equ	midi$bytes$in$q + 1 ; true if buffer overrrun
+
+config$image		equ	midi$receive$error + 1 ; memory image of configuration port last output byte
+
+; the following are the xmodem memory variables
+
+optsav	equ	config$image + 1
+crcflg	equ	optsav + 1	;sets to 'C' if checksum requested
+crcval	equ	crcflg + 1	;current CRC value
+errcde	equ	crcval + 2	;receive error code
+errct	equ	errcde + 1	;error count
+frstim	equ	errct + 1	;turned on after first 'SOH' received
+rcvrno	equ	frstim + 1	;record number received
+recdno	equ	rcvrno + 1	;current record number
+recptr	equ	recdno + 2	;start of transfer in memory
+length	equ	recptr + 2	;length of transfer
+retaddr	equ	length + 2	;return address for calling routine (2 bytes long)
+
+; Lcd Equates for LCD.MAC driver
+
+l1		equ	retaddr + 2	; lcd line 1 memory image
+l2		equ	l1 + 80		; lcd line 2 memory image
+lcd$column	equ	l2 + 80		; last column (0-79) accessed
+lcd$line	equ	lcd$column + 1	; last lcd row accessed (0-1)
+lcd$cr		equ	lcd$line + 1	; current lcd control register
+lcd$dr		equ	lcd$cr + 1	; current lcd data register
+split		equ	lcd$dr + 1	; lcd split(1)/full-screen(0) mode
+lcd$timedout	equ	split + 1	; 0xff if the LCD panel has timed out
+
+lcd$rs232	equ	lcd$timedout + 1	; I/O to lcd/keypad (0) or to RS-232 (1)
+
+; Votrax Speech Synthesizer Variables
+
+port25$image	equ	lcd$rs232 + 1
+inflec		equ	port25$image + 1
+lrflag		equ	inflec + 1
+saveix		equ	lrflag + 1
+ixptr		equ	saveix + 2
+sc01$timedout	equ	ixptr + 2	; 0xff if the SC-1 chip has timed out
+
+drum$tbl$addr	equ	sc01$timedout + 1 ; address of drum pads and footswitch voice addresses
+
+rs232$send$buffer 	equ	drum$tbl$addr + 2
+rs232$send$q$start	equ	rs232$send$buffer + rs232$send$q$length ; word pointer
+rs232$send$q$end	equ	rs232$send$q$start + 2 ; queue end pointer
+rs232$send$bytes$in$q 	equ	rs232$send$q$end + 2	; how many bytes that are in the queue
+
+midi$send$buffer 	equ	rs232$send$bytes$in$q + 1
+midi$send$q$start	equ	midi$send$buffer + midi$send$q$length ; word pointer
+midi$send$q$end		equ	midi$send$q$start + 2 ; queue end pointer
+midi$send$bytes$in$q 	equ	midi$send$q$end + 2	; how many bytes that are in the queue
+
+end$of$variables equ	midi$send$bytes$in$q + 1
+
+;		------ ctc timers ---------
+
+ctc$a	equ	00h		; ctc channel a
+ctc$b	equ	01h		; ctc channel b
+ctc$c	equ	02h		; ctc channel c
+ctc$d	equ	03h		; ctc channel d
+
+;		------ parallel ports -----
+
+pa$data	equ	04h		; pio port a data register
+pa$ctrl	equ	06h		; pio port a control register
+pb$data	equ	05h		; pio port b data register
+pb$ctrl	equ	07h		; pio port b control register
+
+;		------ keyboard driver ------
+
+key$data	equ 	8	; data register
+key$ctrl	equ	9	; control register
+
+keybd$int$enable equ	01000000B	; 8279 interrupt enable
+keybd$release	equ	00100000B
+rom$ram$switch	equ	10000000B
+
+;		---- configuration ports -------
+
+; The config port defaults to hardware 0 upon reset (ROM enabled, heart beat LED on)
+
+config		equ	0bh	; output config port.
+switches	equ	0bh	; dip switch input port
+heartbeat$led	equ	10h	; 0 = LED on, 1 = LED off
+
+;		----- serial ports -----
+
+sio$a$data	equ	0ch		; sio channel a i/o
+sio$a$ctrl	equ	0eh
+sio$b$data	equ	0dh		; sio channel b i/o
+sio$b$ctrl	equ	0fh
+
+;		----- 8253 SIO Baudrate Generators -----
+
+counter$0	equ	10h	; 8253 channel 1 counter
+counter$1	equ	11h	; 8253 channel 2 counter
+counter$2	equ	12h	; 8253 channel 3 counter
+counter$ctrl	equ	13h	; 8253 Control register
+
+;		----- 8255 Parallel Ports -----
+
+pio$a$8255	equ	020h	; port a data i/o
+pio$b$8255	equ	021h	; port b data i/o
+pio$c$8255	equ	022h	; port c data i/o
+pio$ctrl$8255	equ	023h	; control register
+
+; Centronics port equates (uses port A and C of 8255)
+
+auto$ff		equ 1	; = 1 if dont want auto-ff on Epson printer
+			; = 0 if want auto-ff after cr
+
+cen$init$val	equ 136	; 8255 initialization constant
+			; A, B, C lower = output, C upper = input
+
+;		----- Votrax Speech Synthesizer -----
+
+sc01_base	equ	024h	; base of SC01 chip ports
+
+;		----- Lcd Interface -----
+
+;		See LCD.MAC for Lcd Equates
+
+;		----- Real Time Clock -----
+
+clock$base	equ	030h	; 24 I/O port addresses
+
+;		----- 2797 Floppy Disk Controller -----
+
+wd2797		equ	048H		; 2797 base port address
+
+stsreg		equ	wd2797+0	; status register
+cmdreg		equ	wd2797+0	; command register
+trkreg		equ	wd2797+1	; track register
+secreg		equ	wd2797+2	; sector register
+datreg		equ	wd2797+3	; data register
+
+; =-=-=-=-=-=-=-=-=>>>> Start of Main Program  <<<<=-=-=-=-=-=-=-=-=-=
+
+start:	org	0000
+
+;	-- MONITOR ENTRY POINT TABLE --
+
+cold:	jp	init			; 1 Monitor cold entry point
+warm:	jp	prompt			; 2 Monitor warm entry point
+	jp	rst$io$driver		; 3 Centronics, LCD and LED dispatcher
+	jp	rst$rs232$driver	; 4 I/O to the Sio, channels A - Console I/O, Keyboard input
+	jp	rst$midi$driver		; 5 I/O to Sio channel B - Midi I/O
+	jp	rst$system$driver	; 6 Odd system functions
+
+; the following 5 vectors are disk related. They reside in SRAM, so dont use
+; this table to call them.
+
+ 	jp	prompt		; 7  (Select) 	SELECT DISK DRIVE <c>
+	jp	prompt		; 8  (Home)	HOME R/W HEAD
+	jp	prompt		; 9  (Seek)	SEEK TO TRACK <c>, speed <b>
+	jp	prompt		; 10 (Read)	READ SECTOR <c>, <hl> = dma
+	jp	prompt		; 11 (Write)	WRITE SECTOR <c>, <hl> = dma
+	jp	setdens		; 12 set disk type (postponed until select)
+				;    <hl> = sector size (128, 256, 512, 1024)
+				;    <d> = disk type (5 or 8)
+				;    <e> = density (1 or 2)
+	jp	getsad		; 13 Return <c> = sector size code,
+				;    <d> = track, <e> = side from sector
+				;    address header
+	jp	setside		; 14 set side <c> (0 or 1)
+	jp	swbank		; 15 switch memory bank to <A>, 0-15 (ram) or 0fe (eprom)
+				;    ** interrupts will be re-enabled !!!
+
+; ## the relocated vector table for the static ram is located near the
+; ## end of this program.
+
+;   ------  No NMI Interrtupt Currently Used  -----
+
+; NMI Interrupt can't be used because it would crash if a normal
+; interrupt had changed the bank number!
+
+	org	66h
+
+nmi:	retn
+;nmi:	jp	keynmi + mem$top - vec$length + 1
+
+; ------- interrupt vector table moved to top of ram --------
+
+vec$start	equ	$
+
+; Tells the assembler to reset its internal program counter (for label calculations) to
+; the new specified address, while still writing the output bytes sequentially in the
+; current active segment.
+.phase 0	; all references relative to 'vec$abs$mem$loc' now
+
+; --> ctcvec0 must start at ffd0h - No vectors defined yet
+
+ctcvec0:	defw	return
+ctcvec1:	defw	return		; return from interrupt
+ctcvec2:	defw	return		; send out sample address
+ctcvec3:	defw	return
+
+; --> piovec1 must start at ffd8h - No vectors defined yet
+
+pio$vectors	equ	0ffd8h
+
+piovec1:	defw	return
+piovec2:	defw	return
+
+; Some empty space in the table
+
+empty:		defs	4
+
+; --> Siovec1 must start at ffe0h
+
+sio$vectors	equ	0ffe0h
+
+siovec1:	defw	midi$int$send	; Ch B Transmit Buffer empty
+siovec2:	defw	return		; CH B Ext/Status change
+siovec3:	defw	midi$handler	; Ch B Recieve character available
+siovec4:	defw	midi$error	; Ch B Parity, Rx overrrun, framing errors
+
+siovec5:	defw	rs232$int$send	; Ch A Transmit Buffer empty
+siovec6:	defw	rs232$ext$stat 	; CH A Ext/Status change
+siovec7:	defw	rs232$handler  	; Ch A Recieve character available
+siovec8:	defw	rs232$error	; Ch A Parity, Rx overrrun, framing errors
+
+; --> These are the Specialized monitor routine vectors
+
+return		equ	0fff0h		; address of next 2 byte instruction
+		reti			; dummy service routine
+
+; when the footswitch is hit, the Pio interrupt routine
+; recognizes it and calls this vector. Registers a,bc,de,hl
+; can be killed, and you must do a return (this is dispatched
+; in the middle if the interrupt routine).
+
+footswitch$vector	equ	0fff2h
+			ret
+			defs	2
+
+; this is the same as the footswitch$vector except that the
+; Pio interrupt routine jumps here if one of the 8 pads are
+; hit.
+
+drumpad$vector		equ	0fff5h
+			ret
+			defs	2
+
+mon$vec3	equ	0fff8h
+		ret
+		defs	2
+
+mon$vec4	equ	0fffbh
+		ret
+		defs	2
+
+		db	00		; fffeh	 (### empty space ###)
+
+bank		equ	0ffffh		; this is the current bank number
+		db	00
+
+; Restores the assembler's internal program counter back to the actual, physical
+; memory location following the physical bytes written.
+.dephase
+
+vec$length	equ	$ - vec$start
+
+vec$tbl$abs$loc	equ	mem$top - vec$length + 1
+
+; ----------------  Define stack locations --------------------
+
+lstack	equ	mem$top - vec$length		; BSWTCH stack under the vector table
+mstack	equ	mem$top - vec$length-20h
+
+; ----------------- Initialize computer ----------------------
+
+init:	di
+	ld	a,0ffh		; set up interrupt vector
+	ld	i,a
+	im	2		; set z80 to interrupt mode 2
+
+; clear MWA RAM memory to zero.
+
+	xor	a
+	ld	(mwa),a
+	ld	hl,mwa
+	ld	de,mwa+1
+	ld	bc,mwa$length -1
+	ldir
+
+; move bank switch jump table to static ram (this has to go before any other code)
+
+	ld	hl,s$code		; point to jump vector table
+	ld	de,sram			; move it to jump vector location
+	ld	bc,veclen
+	ldir				; go move it
+
+; setup configuration output port status
+
+	ld	a,0			; default to 0
+	ld	(config$image),a
+	out	(config),a
+
+	; Switch to bank passed in A (interrupts will be re-enabled!!)
+	ld	a,beprom		; make sure the system knows we are in
+	call	swbank			; the eprom bank for now...
+
+; move interrupt vector table to top of memory
+
+	ld	hl,vec$start
+	ld	de,vec$tbl$abs$loc
+	ld	bc,vec$length
+	ldir
+
+; make monitor's stack
+
+	ld	sp,mstack
+
+; initialize the RS-232 buffer & midi buffer pointers
+
+	call	clear$rs232$buffers
+	call	clear$midi$buffers
+
+;	----- initialize keyboard and video driver -------
+
+	ld	a,02ah		; set chip clock to 100khz
+	out	(key$ctrl),a
+	ld	a,00000010B	; N-key rollover, encoded scan
+				; 8 8-bit right left character display
+	out	(key$ctrl),a
+
+	ld	a,(config$image) ; get last byte output to configuration port
+	or	keybd$int$enable
+	ld	(config$image),a
+	out	(config),a	; and enable 8270 NMI interrupts
+
+	ld	a,11011111B	; clear display & fifo & interrupt line
+	out	(key$ctrl),a
+
+	; --> must not send out another byte to key$ctrl
+	; --> for 160 usec after the clear display command
+
+	ld	bc,4*4167	;value for 100 ms. delay
+DELAY1:	dec	bc
+	ld	a,b
+	or	c
+	jr	nz, DELAY1
+
+	; Display '1' on the first LED for status update
+	ld	a, 1
+	ld	e, 0
+	call	dis$asc
+
+;	----- Initialize the LCD display
+
+; We now do this later on...
+;	ld	c,8		; Lcd initialization routines
+;	call	rst$io$driver
+
+	ld	a,0ffh
+	ld	(lcd$rs232),a	; default to RS232 output first
+
+;	------ initialize CTC Timers for Serial Port A -----
+
+; RCL9, the schematics say that the CTC chip has been removed due to conflicts with the SIO.
+
+; 	--> no initialization at present. The timers can be
+; 	used for interruptable utility timers.
+
+;	------ Initialize 8253 SIO Baudrates for Channels A & B
+
+	in	a,(switches)	; get power-on baudrate
+	and	0fh
+	call	setbd1
+
+	; now program SIO Channel B for 31.25kbaud MIDI
+
+	ld	a,77h		; select channel 1
+	out	(counter$ctrl),a
+	ld	a,04		; program for 31.25 kbaud
+	out	(counter$1),a
+	ld	a,0
+	out	(counter$1),a
+
+	; Display '2' on the second LED for status update
+	ld	a, 2
+	ld	e, 1
+	call	dis$asc
+
+;	----- initialize z-sio serial --------
+
+; initialize SIO A registers
+
+	ld	c,sio$a$ctrl
+	ld	b,tbl$a$length
+	ld	hl,sio$a$tbl
+	otir			; send to SIO A control register
+
+; initialize SIO B, and the interrupt vector
+
+	ld	c,sio$b$ctrl
+	ld	b,tbl$b$length
+	ld	hl,sio$b$tbl
+	otir			; send to SIO A control register
+
+	ld	bc,4*4167	;value for 100 ms. delay
+DELAY2:	dec	bc
+	ld	a,b
+	or	c
+	jr	nz, DELAY2
+
+	; Display '3' on the third LED for status update
+	ld	a, 3
+	ld	e, 2
+	call	dis$asc
+
+;	----- Initialize the LCD display
+
+	ei
+
+	call	pr$string$rs232
+	defm	cr,lf,lf,'Initializing LCD display',cr,lf,eot
+
+	ld	c,8		; Lcd initialization routines
+	call	rst$io$driver
+
+	; Display '4' on the fourth LED for status update
+	ld	a, 4
+	ld	e, 3
+	call	dis$asc
+
+	jp	inipio		; go init z80 pio
+
+sio$a$tbl:	defb	18H	; channel reset
+
+		defb	00010000B ; reset EXT/Status interrupts
+
+		defb	4	; select Write register 4
+		defb	4CH	; 16x clock, 2 stop bits, no parity
+
+		defb	3	; Select write register 3
+		defb	0C1H	; 8 data bits, Rx Enable only
+
+		defb	5	; Select write register 5
+		defb	01101000B ; enable Tx, Tx 8 bits
+
+		defb	00010000B ; reset EXT/Status interrupts
+
+		defb	1
+		defb	00011111B ; status affects vector
+				; Tx INT enable, EXT INT enable
+				; INT on all received characters
+
+tbl$a$length	equ	$ - sio$a$tbl
+
+
+sio$b$tbl:	defb	18H	; channel reset
+
+		defb	2	; program the interrupt vector
+		defb	sio$vectors - ((sio$vectors / 256) * 256) ; send LSB of vector address
+
+		defb	00010000B ; reset EXT/Status interrupts
+
+		defb	4	; select Write register 4
+		defb	4CH	; 16x clock, 2 stop bits, no parity
+
+		defb	3	; Select write register 3
+		defb	0C1H	; 8 data bits, Rx Enable only
+
+		defb	5	; Select write register 5
+		defb	01101000B ; enable Tx, Tx 8 bits
+
+		defb	00010000B ; reset EXT/Status interrupts
+
+		defb	1
+		defb	00011110B ; status affects vector,
+				; Tx INT enable, EXT INT disable
+				; INT on all received characters
+
+tbl$b$length	equ	$ - sio$b$tbl
+
+;	----- initialize parallel z80pio -------
+
+inipio:
+	call	pr$string$rs232
+	defm	'Initializing Parallel Z80 PIO',cr,lf,eot
+
+	ld	a,11001111b	; select input mode 3
+	out	(pa$ctrl),a
+	ld	a,0ffh		; set bits to input
+	out	(pa$ctrl),a
+	ld	a,00000111b	; disable bit interrupt
+	out	(pa$ctrl),a
+
+	ld	a,11001111b	; select input mode 3
+	out	(pb$ctrl),a
+	ld	a,0ffh		; set bits to input
+	out	(pb$ctrl),a
+	ld	a,00000111b	; disable bit interrupt
+	out	(pb$ctrl),a
+
+;	----- initialize 8255 I/O Ports -----
+
+	call	pr$string$rs232
+	defm	'Initializing 8255 I/O ports',cr,lf,eot
+
+	ld	a,137		; set A & B to output
+	out	(pio$ctrl$8255),a ; and Port C to input
+	ld	a,0ffh
+	out	(pio$a$8255),a	; send 255 to turn off simon game
+
+	; Display '5' on the fifth LED for status update
+	ld	a, 5
+	ld	e, 4
+	call	dis$asc
+
+;	----- initialize disk drive characteristics -----
+
+	call	pr$string$rs232
+	defm	'Initializing Disk drive characteristics',cr,lf,eot
+
+	ld	a,0c3h		; make drive selects in-active & motor off,
+				; Sasi reset* and select* in-active
+	out	(pio$b$8255),a
+
+	ld	hl,dbuf
+	ld	(dmadr),hl	; setup default dma address
+
+	ld	a,1		; (0=3ms, 1=6ms, 2=10ms or 3=15ms)
+	ld	(speed),a	; set default speed
+
+	ld	hl,200h		; boot up on 5" double density
+	ld	e,2
+	call	setdens		;set sector size,disk type,density
+
+	xor	a
+	ld	(side),a	; default to side 0
+	ld	c,a		;select side 0
+	call	setside		;ensure side zero
+
+;	----- Initialize Votrax Speech Synthesizer -----
+
+	; Display '6' on the sixth LED for status update
+	ld	a, 6
+	ld	e, 5
+	call	dis$asc
+
+	call	pr$string$rs232
+	defm	'Initializing Votrax SC-01 speech synthesizer.',cr,lf,eot
+	call	sc01$init		; call routine in speak.mac
+
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+;                   Resident Z80 Monitor
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+	; Clear the LED display
+	; call	led$clear
+
+	defm	'Press 'j' or LCD/TV key to swap between RS-232 and LCD.',cr,lf,eot
+	call	sc01$init		; call routine in speak.mac
+
+zmon:	ei
+
+gopr:
+	call	pr$string$lcd
+	defm	cr,lf,'Colossus Z80 Monitor v2.5, Aug 2026',cr,lf,eot
+	call	pr$string$lcd
+	defm	'"j" to swap RS-232/LCD. ',eot
+
+	call	pr$string$rs232
+	defm	cr,lf
+	defm	' ######   #######  ##        #######   ######   ######  ##     ##  ######',cr,lf
+	defm	'##    ## ##     ## ##       ##     ## ##    ## ##    ## ##     ## ##    ##',cr,lf
+	defm	'##       ##     ## ##       ##     ## ##       ##       ##     ## ##',cr,lf
+	defm	'##       ##     ## ##       ##     ##  ######   ######  ##     ##  ######',cr,lf
+	defm	'##       ##     ## ##       ##     ##       ##       ## ##     ##       ##',cr,lf
+	defm	'##    ## ##     ## ##       ##     ## ##    ## ##    ## ##     ## ##    ##',cr,lf
+	defm	' ######   #######  ########  #######   ######   ######   #######   ######',cr,lf,eot
+
+	call	pr$string$rs232
+	defm	cr,lf
+	defm	'     THE COLOSSUS CONTROL COMPUTER. DESIGNED BY RCL9 (1985-1987).', cr,lf,eot
+
+	call	pr$string$rs232
+	defm	cr,lf,'Colossus Z-80 Monitor, v2.5. Copyright (c) August 2026 by RCL9',cr,lf,eot
+
+	ld	a,(lcd$rs232)
+	or	a
+	jr	z,sayit		; don't print time and date if LCD display
+	call	snd$timdat	; print time and date
+sayit:
+	call	speak
+	defm	'READY',eot
+
+;	----- Show the monitor's prompt -----
+
+prompt:	call	print$string
+	defm	'Colossus> ',eot
+
+;	call	pr$string$lcd
+;	defm	'Colossus> ',eot
+;	call	pr$string$rs232
+;	defm	'Colossus> ',eot
+
+	ld	hl,linbuf
+	ld	c,78		;allow 78 characters input
+	call	getlin		;input a bufered console line
+	jr	c,prompt	;goto prompt if control codes
+
+	xor	a
+	ld	(escflg),a
+	call	crlf
+	ld	a,(linbuf)	;get first character in line
+	cp	cr
+	jr	z,prompt	;jump if a null line
+	cp	' '
+	jr	nz,not$spc
+	ld	a,(linbuf+1)
+not$spc:ld	hl,cmdtab	;search for a matching character
+	ld	bc,cmdsiz/3	; in command search table
+	call	search
+	jr	nz,error	;try again if search fails
+	push	bc
+	ld	iy,linbuf+1
+	call	params		;input numeric parameters from
+	pop	ix		; line buffer and test if error
+	jr	c,error
+	ld	hl,(param1)
+	ld	de,(param2)
+	ld	bc,(param3)
+	call	callx		;call subroutine @ ix
+	jr	c,error
+	jr	prompt		;go back to prompt
+
+error:	call	print$string
+	defm	cr,lf,'Parameter error.',cr,lf,eot
+	jp	prompt
+
+help:	call	print$string
+	defm	cr,lf,'Command set:',cr,lf
+	defm	cr,lf,'1          print time & date'
+	defm	cr,lf,'2          set clock'
+	defm	cr,lf,'3          Test the LCD display - perform a whole series of tests'
+	defm	cr,lf,'4          4<value> - Test the LCD display - output one value and report timeout'
+	defm	cr,lf,'5          5<value> - Test the LCD display - ouput one value continuously'
+	defm	cr,lf,'a(djust)   adjust baudrate'
+	defm	cr,lf,'b(oot)     b<dram bank#>,d<isk #> - default 0,0'
+	defm	cr,lf,'c(opy)     c<start>,<end>,<dest>'
+	defm    cr,lf,'d(ump)     d<start>,<end>'
+	defm	cr,lf,'e(memory)  e<addr>'
+	defm	cr,lf,'f(ill)     f<start>,<end>,<byte>'
+	defm	cr,lf,'g(oto)     g<addr>'
+	defm	cr,lf,'i(nput)    i<port>'
+	defm	cr,lf,'g(oto)     g<addr>'
+	defm	cr,lf,'j          switch between Lcd and Rs-232 Output'
+	defm	cr,lf,'l(ed)      Test the LED display'
+	defm	cr,lf,'m(idi)     Show the MIDI sub-menu'
+	defm	cr,lf,'o(utput)   o<port#>,<data>'
+	defm	cr,lf,'p(lay)     p<lays> game of Simon'
+	defm	cr,lf,'r(eceive)  r<destination>  <-- Xmodem protocol'
+	defm	cr,lf,'s(end)     s<start>,<end>  <-- Xmodem protocol'
+	defm	cr,lf,'t(est)     t<memory_start>,<end>'
+	defm	cr,lf,'u(read)    u<unit>,<track>,<sector>'
+	defm	cr,lf,'v(otrax)   Speech converter'
+	defm	cr,lf,'w(rite)    w<unit>,<track>,<sector>'
+	defm	cr,lf,'x(select)  x<8-8" 5-5">,<0,1 -side>,<1-s 2-d density>'
+	defm	cr,lf,'y(dma)     y<dma r/w address>'
+	defm	cr,lf,'z(sector)  z<size> 80 hex default'
+	defm	cr,lf,'?          print help'
+	defm	cr,lf,lf,'Terminate commands with RETURN.'
+	defm	cr,lf
+	defb	eot
+	jp	prompt
+
+callx:	jp	(ix)		;call subroutine @ ix
+
+cmdtab:
+	defb	'L'
+	defb	'W'
+	defb	'U'
+	defb	'O'
+	defb	'I'
+	defb	'G'
+	defb	'T'
+	defb	'F'
+	defb	'E'
+	defb	'C'
+	defb	'B'
+	defb	'D'
+	defb	'Z'
+	defb	'Y'
+	defb	'X'
+	defb	'A'
+	defb	'?'
+	defb	'M'
+	defb	'S'
+	defb	'R'
+	defb	'P'
+	defb	'1'
+	defb	'2'
+	defb	'3'
+	defb	'4'
+	defb	'5'
+	defb	'J'
+	defb	'V'
+
+	defw	votrax		;speech synthesizer text input test
+	defw	toggle$display	;toggle between Lcd and Rs-232 output
+	defw	testa	;test the LCD display
+	defw	testb	;test the LCD display
+	defw	test$lcd$display ;test the LCD display
+	defw	setclock	;set the clock
+	defw	snd$timdat	;print time and date to output
+	defw	play$simon	;plays game of simon
+	defw	rec$xmodem	;xmodem receive
+	defw	send$xmodem	;xmodem send
+	defw	midi$prompt	;midi sub menu
+	defw	help		;print help menu
+	defw	setbaud		;select new baudrate
+	defw	diskx		;select 5 or 8 side and density
+	defw	disky		;select dma address for disk i/o
+	defw	diskz		;select sector size
+	defw	memdmp		;dump memory in hex/ascii
+	defw	boot		;boot up cp/m
+	defw	block		;memory block move
+	defw	view		;memory examine/change
+	defw	fill		;fill memory
+	defw	test		;ram diagnostic
+	defw	goto		;jump to memory location
+	defw	incmd		;read from input port
+	defw	outcmd		;write to output port
+	defw	dskcmd		;display disk sector data
+	defw	dskwrt		;write disk sector
+	defw	test$leds	;test the LED display
+cmdsiz	equ	$-cmdtab
+
+; ---------------- Test the LED display -------------------
+
+; RCL9, May 2026
+
+test$leds:
+	call	print$string
+	defb	'LED - 5 of 6 digits of value: 12345. Press key.',cr,lf, eot
+	; Display DE as decimal number, left justified, no proceeding zeros
+	ld	de, 12345
+	call	display$de
+	call	kbdin		; wait for a key input
+
+	; Turn one, or both of colons on. E = 0 left side, 1 = right side, 2 = both
+	call	print$string
+	defb	'LED - turning on colons. Press key 3 times',cr,lf, eot
+	ld	e, 0
+	call	colon$on
+	call	kbdin		; wait for a key input
+	ld	e, 1
+	call	colon$on
+	call	kbdin		; wait for a key input
+	ld	e, 2
+	call	colon$on
+	call	kbdin		; wait for a key input
+
+	; Turn one or both colons off. E = 0 left side, 1 = right side, 2 = both
+	call	print$string
+	defb	'LED - turning off colons. Press key 2 times',cr,lf, eot
+	ld	e, 0
+	call	colon$off
+	call	kbdin		; wait for a key input
+	ld	e, 1
+	call	colon$off
+	call	kbdin		; wait for a key input
+
+	; Turn on one of the decimal points on, E = digit number # (0 = left side)
+	call	print$string
+	defb	'LED - turning on decimal points. Press key 6 times',cr,lf, eot
+	ld	e, 0
+	call	dec$on
+	call	kbdin		; wait for a key input
+	ld	e, 1
+	call	dec$on
+	call	kbdin		; wait for a key input
+	ld	e, 2
+	call	dec$on
+	call	kbdin		; wait for a key input
+	ld	e, 3
+	call	dec$on
+	call	kbdin		; wait for a key input
+	ld	e, 4
+	call	dec$on
+	call	kbdin		; wait for a key input
+	ld	e, 5
+	call	dec$on
+	call	kbdin		; wait for a key input
+
+	; Turn off one of the decimal points, E = digit number
+	ld	e, 0
+	call	dec$off
+
+	; Clear the LED display
+	call	led$clear
+
+	; Display register A as numeric digit (0-9) at E (E=0=left side)
+	call	print$string
+	defb	'LED - displaying digits 0 through 5 and 8. Press key 6 times',cr,lf, eot
+	ld	a, 0
+	ld	e, 0
+	call	dis$asc
+	call	kbdin		; wait for a key input
+	ld	a, 1
+	ld	e, 1
+	call	dis$asc
+	call	kbdin		; wait for a key input
+	ld	a, 2
+	ld	e, 2
+	call	dis$asc
+	call	kbdin		; wait for a key input
+	ld	a, 3
+	ld	e, 3
+	call	dis$asc
+	call	kbdin		; wait for a key input
+	ld	a, 4
+	ld	e, 4
+	call	dis$asc
+	call	kbdin		; wait for a key input
+	ld	a, 8
+	ld	e, 5
+	call	dis$asc
+	call	kbdin		; wait for a key input
+
+	; Clear the LED display
+	call	led$clear
+
+	ret
+
+; ---------------- MIDI SUB MENU -------------------
+
+midi$prompt:
+	call	print$string
+	defb	cr,lf
+	defm	'Midi> '
+	defb	eot
+	ld	hl,linbuf
+	ld	c,78		; allow 78 characters input
+	call	getlin		;input a bufered console line
+	jr	c,midi$prompt	;goto prompt if control codes
+
+	xor	a
+	ld	(escflg),a
+	call	crlf
+	ld	a,(linbuf)	;get first character in line
+	cp	cr
+	jr	z,midi$prompt	;jump if a null line
+	cp	' '
+	jr	nz,notspc
+	ld	a,(linbuf+1)
+notspc:	ld	hl,midi$cmdtab	;search for a matching character
+	ld	bc,midi$cmdsiz/3; in command search table
+	call	search
+	jr	nz,param$error	;try again if search fails
+	push	bc
+	ld	iy,linbuf+1
+	call	params		;input numeric parameters from
+	pop	ix		; line buffer and test if error
+	jr	c,param$error
+	ld	hl,(param1)
+	ld	de,(param2)
+	ld	bc,(param3)
+	call	callx		;call subroutine @ ix
+	jr	c,param$error
+	jr	midi$prompt	;go back to prompt
+
+param$error:
+	call	print$string
+	defm	cr,lf,'Parameter error.',cr,lf,eot
+	jp	midi$prompt
+
+midi$help:
+	call	print$string
+	defm	cr,lf,'Midi Commands:',cr,lf
+	defm	cr,lf,'-   Return to main menu'
+	defm	cr,lf,'a   Arpeggiator'
+	defm	cr,lf,'e   Enable drum pad & Footswitch interrupts'
+	defm	cr,lf,'d   Disable drum pad & Footswitch interrupts'
+	defm	cr,lf,'m   Map drum pads'
+	defm	cr,lf,'c   Copy Midi in to Midi out'
+	defm	cr,lf,'p   Play Speech Synth From Jx8p'
+	defm	cr,lf,'?   Help'
+	defm	cr,lf,lf,'Terminate commands with RETURN'
+	defm	cr,lf
+	defb	eot
+	jp	midi$prompt
+
+midi$cmdtab:
+	defb	'-'
+	defb	'E'
+	defb	'D'
+	defb	'M'
+	defb	'A'
+	defb	'C'
+	defb	'?'
+	defb	'P'
+
+	defw	play$votrax	; play speech synthesizer from Jx8p
+	defw	midi$help	; print midi help menu
+	defw	midi$copy	; loop Midi In to Midi Out
+	defw	arpeggiator	; emulate Jupitor 6 arpeggiator
+	defw	drum$map	; map drum pad inputs to key-on codes
+	defw	disable$drum	; disable drum and footswitch interrupts
+	defw	enable$drum	; enable drum and footswitch interrupts
+	defw	prompt		; return to main menu
+
+midi$cmdsiz	equ	$-midi$cmdtab
+
+; ------->>>	Emulate Jupitor 6 Arpeggiator
+
+arpeggiator:
+
+	call	print$string
+	defm	cr,lf,'Not implemented',eot
+	jp	midi$prompt
+
+; ------->>>	Copy Midi In to Midi Out
+
+midi$copy:	call	clear$midi$buffers
+
+keybd$wait:	call	kbdst		; stop if keyboard pressed
+		ret	nz
+		call	midi$status
+		jr	z,keybd$wait
+
+		ld	a,(midi$receive$error)
+		cp	false
+		jr	z,midi$ok
+		cp	buffer$overrun$error
+		jr	nz,sio$err
+		call	print$string
+		db	'Receive buffer overflow error.',cr,lf,eot
+		jr	reset$stat
+
+sio$err:	call	print$string
+		db	'Midi SIO error indicated (overrun?)',cr,lf,eot
+
+reset$stat:	ld	a,false
+		ld	(midi$receive$error),a
+
+midi$ok:	call	midi$in		; get Midi data
+		call	midi$out	; send back out to Midi
+
+		jr	keybd$wait
+
+; ------->>>	Play Votrax Speech Synthesizer from Jx8p
+
+play$votrax:	call	print$string
+		defm	cr,lf,'Put JX8P into LOCAL OFF mode. TONE buttons select 64 voice types.',cr,lf,eot
+		call	clear$midi$buffers
+
+vo$loop:	call	kbdst		; stop if keyboard pressed
+		ret	nz
+		call	get$data	; look for data
+		and	0f0h		; mask off midi channel
+		cp	090h		; note on/off?
+		jr	z,note
+		cp	0c0h		; program change?
+		jr	z,pgm$change
+		cp	0b0h		; all notes off?
+		jr	z,noteoff
+		jr	vo$loop		; no, not recognized, loop
+
+; a tone button was pressed on the synth
+
+pgm$change:	call	get$data	; get the program key number (0-127)
+		cp	64
+		jr	c,vo$loop
+		sub	64		; two preset banks select voices
+		ld	b,a		; save it as new voice number
+		jr	vo$loop		; and continue monitoring
+
+note:		call	get$data	; get note number
+		ld	c,a		; save it
+		call	get$data	; get velocity (useless)
+		cp	00
+		jr	z,vo$loop	; note off, ignore
+
+; turn on the note
+
+		ld	a,c		; get note number
+		cp	36		; no notes less than 36
+		jr	c,vo$loop
+		sub	36
+		cp	25		; only 26 frequency divisions!
+		jr	c,notbelow
+		ld	a,25		; truncate upper keyboard to one frequency
+notbelow:	add	90h		; offset to frequency command
+		push	bc		; save voice type
+		call	send$sc01	; set frequency
+		pop	bc		; get voice type
+		ld	a,b
+		call	send$sc01	; turn on voice
+		jr	vo$loop		; and continue loop
+
+noteoff:	call	get$data
+		cp	07bh		; second byte of ALL NOTES OFF?
+		jr	nz,vo$loop	; no, not all notes off command
+		call	get$data	; kill third byte
+		ld	a,03fh		; no noise command for chip
+		call	send$sc01
+		jr	vo$loop		; and continue monitoring
+
+get$data:	call	midi$status
+		jr	z,get$data
+		call	midi$in		; get Midi data
+		ret
+
+; ------->>>	Map drum pad inputs to Midi key-on codes
+
+drum$map:call	print$string
+	defb	cr,lf,'Drum Pad/Footswitch Code Mapper.',cr,lf,eot
+
+mod$pad:call	print$string
+	defb	cr,lf,'Option? (? for help) ',eot
+
+mod$1:	call	kbdin
+	cp	cr
+	jp	z,midi$prompt	; exit if return hit
+	cp	'A'
+	jr	c,a$num
+	cp	'a'
+	jr	c,upp$case
+	sub	20h
+
+upp$case:cp	'I'		; initialize the cartridge
+	jp	z,init$cart
+	cp	'M'		; print midi map
+	jp	z,prt$midi$map
+	cp	'P'		; print pad mappings
+	jp	z,prt$pads$map
+	cp	'T'		; toggle rom/ram mapping
+	jp	z,toggle$maps
+	cp	'D'		; print TR-707 drum map
+	jp	z,prt$map
+	cp	'F'		; modify footswitch map
+	jp	z,mod$swt
+a$num:	cp	'?'		; print help menu
+	jp	z,mod$hlp
+	cp	'1'
+	jr	c,mod$1		; modify pads 1-9
+	cp	'9'+1
+	jr	nc,mod$1
+	call	crlf
+
+; re-map one of the 9 selected drum pads
+
+;--> allow input from midi buss!
+
+		sub	'0'		; make selection binary
+edit$pads:	dec	a		; now 0-9
+
+		ld	b,a
+		call	cart$check	; see if cart in
+		jp	c,mod$pad
+		call	check$we
+		jp	c,mod$pad
+
+		call	print$string
+		defb	'Edit pad # ',eot
+		ld	h,0
+		ld	l,b
+		inc	l
+		call	dec$out
+		call	print$string
+		defb	'. (Default params shown in [], RETURN to keep them).',cr,lf,lf
+		defb	'First voice [',eot
+
+		ld	hl,ram$pack$data$start
+		ld	a,b
+		sla	a
+		ld	e,a
+		ld	d,0
+		add	hl,de
+		ld	e,(hl)
+		inc	hl
+		ld	d,(hl)		; address of pad map
+		push	de
+		pop	bc
+		ld	a,(de)		; get first code
+		ld	l,a
+		ld	h,0
+		call	dec$out
+		call	print$string
+		defb	'] midi map #? ',eot
+
+		ld	hl,linbuf
+		call	inp$dec		; input decimal string
+		ld	hl,linbuf
+		call	asc$dec
+		jr	c,voi$default
+		cp	0		; CR just pressed?
+		jr	z,voi$default	; yes, default
+
+		ld	a,e		; only keep lower byte
+		ld	(bc),a
+		inc	bc
+		ld	a,eotbl		; put in just in case
+		ld	(bc),a
+		dec	bc
+
+voi$default:	inc	bc
+
+		call	print$string
+		defb	'Second voice [',eot
+
+		ld	a,(bc)
+		ld	l,a
+		ld	h,0
+		call	dec$out
+		call	print$string
+		defb	'] midi map #? ',eot
+
+		ld	hl,linbuf
+		call	inp$dec		; input decimal string
+		ld	hl,linbuf
+		call	asc$dec
+		jr	c,mod$ret
+		cp	0		; CR just pressed?
+		jr	z,mod$ret	; yes, default
+
+		ld	a,e		; only keep lower byte
+		ld	(bc),a
+
+mod$ret:	call	print$string
+		defb	'Turn off the Write Enable switch.',cr,lf,eot
+		jp	mod$pad
+
+; Edit the midi map
+
+;	--> midi channel input should be dec so 0-15
+
+
+; modify the pad map of the footswitch
+
+mod$swt:	call	crlf
+		ld	a,10
+		jp	edit$pads
+
+; toggle maps between rom and ram
+
+toggle$maps:	call	crlf
+		ld	hl,(drum$tbl$addr)
+		ld	de,drum$vec$tbl
+		ld	a,d
+		cp	h
+		jr	z,toggle$to$ram
+		ld	a,e
+		cp	l
+		jr	z,toggle$to$ram
+		ld	(drum$tbl$addr),de
+		call	print$string
+		defb	cr,lf,'Toggled to default rom mappings.',cr,lf,eot
+		jp	mod$pad
+
+
+toggle$to$ram:	call	cart$check
+		jp	c,mod$pad
+
+		ld	hl,ram$pack$data$start ; Jx8p cartridge in computer now
+		ld	(drum$tbl$addr),hl
+		call	print$string
+		defb	cr,lf,'Toggled to ram cartridge mappings.',cr,lf,eot
+		jp	mod$pad
+
+; See if JX8P cartridge installed.
+
+; 	Carry set if user wont insert cartridge
+
+cart$check:	ld	a,(8100h)
+		cp	'r'
+		jr	nz,no$cart
+		ld	a,(8101h)
+		cp	'a'
+		jr	nz,no$cart
+		ld	a,(8102h)
+		cp	'm'
+		jr	nz,no$cart
+		scf
+		ccf
+		ret
+
+no$cart:	call	print$string
+		defb	cr,lf,'No cartridge in slot, or not ram bank # 8',cr,lf
+		defb	'Insert JX8P cartridge or change the bank (''X'' to quit)',eot
+		call	echo
+		push	af
+		call	crlf
+		pop	af
+		cp	'X'
+		scf
+		ret	z		; return if user doesnt put in cartridge
+		jp	cart$check
+
+; Check JX8P cartridge to see that Write enable is on
+
+check$we:	ld	a,0		; see if we can write into
+		ld	(8103h),a	; the ram pack
+		ld	a,(8103h)
+		cp	0
+		jr	nz,no$we
+
+		ld	a,0ffh
+		ld	(8103h),a
+		ld	a,(8103h)
+		cp	0ffh
+		jr	nz,no$we
+		scf
+		ccf
+		ret
+
+no$we:		call	print$string
+		defb	cr,lf,'Turn Write Enable ON! Press RETURN or ''X'' to quit.',eot
+		call	kbdin
+		call	crlf
+		cp	'X'
+		jr	nz,check$we
+		cp	'x'
+		jr	nz,check$we
+		scf
+		ret
+
+; initialize the ram pack (bank 8) for alternate mapping storage
+
+init$cart:	call	print$string
+		defb	cr,lf,lf,'Insert JX8P cartridge and select bank 8, then turn on write enable.',cr,lf
+		defb	'Press RETURN when done.',eot
+		call	kbdin		; wait for char
+		call	check$we
+		jp	c,mod$pad
+
+		call	check$we	; see that WE* is on
+		jp	c,mod$pad
+
+		ld	hl,drum$vec$tbl
+		ld	de,ram$pack$data$start
+		ld	bc,drum$info$length
+		ldir
+
+		ld	hl,ram$name	; move 'ram' to cartridge
+		ld	de,08100h	; as an identifier
+		ld	bc,3
+		ldir
+
+; no redo the midi and pad lookup tables to look at the ram area
+
+
+		ld	hl,ram$pack$data$start
+
+mod$addr:	push	hl		; save start of change
+		ld	e,(hl)
+		inc	hl
+		ld	d,(hl)
+		ld	a,d
+		or	e
+		jr	z,done$addr	; all done, 0000 delimiter found
+		ld	hl,ram$pack$data$start - drum$vec$tbl
+		add	hl,de
+		ex	de,hl
+		pop	hl
+		ld	(hl),e		; put back new address
+		inc	hl
+		ld	(hl),d
+		inc	hl
+		jr	mod$addr
+
+done$addr:	call	print$string
+		defb	'Operation complete. You may turn the Write Enable off now.',cr,lf,eot
+		jp	mod$pad
+
+ram$name:	defb	'ram'		; rambank 8 identifier
+
+; print out the Current Midi map (not the pad map)
+
+prt$midi$map:	call	print$string
+		defb	cr,lf,lf,'Voice #  Send ALL NOTES OFF  Channel  Note On  Velocity  Voice Name',cr,lf
+		defb	'-------  ------------------  -------  -------  --------  ----------',cr,lf,eot
+
+		ld	bc,0
+		ex	af,af'
+		ld	a,0
+		ex	af,af'
+prt$next$line:	call	crlf
+		call	print$string
+		defb	'   ',eot
+		ex	af,af'
+		inc	a	; inc line number
+		ld	h,0
+		ld	l,a
+		ex	af,af'
+		call	dec$out
+		ld	a,5
+		call	print$spaces
+		ld	hl,(drum$tbl$addr)
+		ld	de,20
+		add	hl,de	; point to midi$map$tbl
+		add	hl,bc
+		inc	bc
+		inc	bc
+		ld	e,(hl)
+		inc	hl
+		ld	d,(hl)	; get addr of midi data
+		ld	a,e
+		or	d	; see if end of table
+		jp	z,mod$pad
+
+		ld	a,(de)	; get yes/no
+		inc	de
+		cp	yes
+		jr	nz,its$no
+		call	print$string
+		defb	'       Yes',eot
+		jr	prt$chan
+
+its$no:		call	print$string
+		defb	'        No',eot
+
+prt$chan:	ld	a,13
+		call	print$spaces
+		ld	a,(de)	; get midi channel
+		inc	a
+		inc	de
+		ld	l,a
+		ld	h,0
+		call	dec$out
+
+		ld	a,7
+		call	print$spaces
+		ld	a,(de)	; get midi note on
+		inc	de
+		ld	l,a
+		ld	h,0
+		call	dec$out
+
+		ld	a,7
+		call	print$spaces
+		ld	a,(de)	; get midi velocity
+		inc	de
+		ld	l,a
+		ld	h,0
+		call	dec$out
+
+		ld	a,5
+		call	print$spaces
+send$name:	ld	a,(de)
+		inc	de
+		cp	eov
+		jp	z,prt$next$line
+		call	crtout
+		jr	send$name
+
+; Prints how the pads are mapped to the midi map table
+
+prt$pads$map:	call	print$string
+		defb	cr,lf,lf,'Pad Number (footswitch = 10)  Voice # in midi map table',cr,lf
+		defb	'----------------------------  -------------------------',cr,lf,eot
+
+		ld	bc,0
+		ld	hl,1		; row counter
+prt$next$pad:	push	hl
+		ld	hl,(drum$tbl$addr)
+		add	hl,bc
+		inc	bc
+		inc	bc
+		ld	e,(hl)
+		inc	hl
+		ld	d,(hl)
+		inc	hl
+		ld	a,11
+		call	print$spaces
+		pop	hl
+		call	dec$out		; print line number
+		inc	hl
+		push	hl
+		ld	a,26
+		call	print$spaces
+print$notes:	ld	a,(de)
+		inc	de
+		cp	eotbl
+		jr	z,done$row
+		ld	h,0
+		ld	l,a
+		call	dec$out
+		ld	a,(de)		; this redundancy is
+		cp	eotbl		; so not to print comma
+		jr	z,done$row	; if no more data
+		ld	a,','
+		call	crtout
+		jr	print$notes
+
+done$row:	call	crlf
+		pop	hl
+		ld	a,l
+		cp	11		; at end of table?
+		jr	nz,prt$next$pad
+		jp	mod$pad
+
+mod$hlp:call	print$string
+
+	defb	cr,lf,lf,'Options:',cr,lf
+	defb	'   m   - Current pad mapping',cr,lf
+	defb	'   p   - Current pads maps',cr,lf
+	defb	'   t   - Toggle between catridge mapping & default rom mapping',cr,lf
+	defb	'   1-9 - Modify voice mapping on this pad #',cr,lf
+	defb	'   f   - Modify voice mapping of footswitch',cr,lf
+	defb	'   i   - Initialize ram cartridge to default mapping',cr,lf
+	defb	'   ?   - Help menu',cr,lf
+	defb	'   d   - TR-707 drum map',cr,lf
+	defb	'<RETURN> to exit',cr,lf,eot
+	jp	mod$pad
+
+prt$map:call	print$string
+	defb	cr,lf,lf
+	defb	'TR-707 Midi Map (decimal)',cr,lf,lf
+	defb	'35 - Bass Drum 1  36 - Bass Drum 2   37 - Rim Shot    ',cr,lf
+	defb	'38 - Snare Drum 1 39 - Hand Clap     40 - Snare Drum 2',cr,lf
+	defb	'41 - Low Tom      42 - Closed hi-hat 45 - Mid Tom     ',cr,lf
+	defb	'46 - Open Hi-hat  48 - High Tom      49 - Crash Cymbal',cr,lf
+	defb	'51 - Ride Cymbal  54 - Tambourine    56 - Cowbell     ',cr,lf,lf
+	defb	'Keyboard Map: Middle C = Midi code 60',cr,lf,eot
+	jp	mod$pad
+
+
+; ------------------- Default Midi Map ----------------------
+
+ram$pack$data$start equ	08104h	; data in cartidge starts 260 bytes from the start
+
+; ** The alternate Midi Map is put in bank 8 of JX8P ram pack. **
+
+; drum pad vector table into the pad map 'drum$table'
+; this is also at 8104h in the cartridge
+
+drum$vec$tbl:	defw	pad$1
+		defw	pad$2
+		defw	pad$3
+		defw	pad$4
+		defw	pad$5
+		defw	pad$6
+		defw	pad$7
+		defw	pad$8
+		defw	pad$9
+
+foot$vec$tbl:	defw	foot$1
+
+; this maps the map# (1-xx) in the pad$tbl into an address
+; of the midi mapping information (map$x info).
+; this is at 8104h+20 in the cartridge
+
+midi$map$tbl:	defw	map$1
+		defw	map$2
+		defw	map$3
+		defw	map$4
+		defw	map$5
+		defw	map$6
+		defw	map$7
+		defw	map$8
+		defw	map$9
+		defw	map$10
+		defw	map$11
+		defw	map$12
+		defw	map$13
+		defw	map$14
+		defw	map$15
+		defw	map$16
+		defw	map$17
+		defw	map$18
+		defw	map$19
+		defw	map$20
+		defw	map$21
+		defw	map$22
+		defw	map$23
+		defw	map$24
+		defw	map$25
+		defw	map$26
+		defw	map$27
+		defw	0000		; end of table
+
+; Default drum table - (pads 0-8)
+;    (send midi ALL NOTES OFF first?),(midi channel, 0-15)
+;    (midi on code),(velocity), name of midi channel, delimiter
+
+; NOTE: the midi channel is the channel-1 (ie 0 = channel 1)
+
+eov	equ	0ffh		; voice definition delimiter
+eotbl	equ	0feh		; end of voice table delimiter
+
+map$1:	db	no,0,35,100,'Bass drum 1',eov
+map$2:	db	no,0,36,100,'Bass drum 2',eov
+map$3:	db	no,0,37,100,'Rim shot',eov
+map$4:	db	no,0,38,100,'Snare 1',eov
+map$5:	db	no,0,39,100,'Handclap',eov
+map$6:	db	no,0,40,100,'Snare 2',eov
+map$7:	db	no,0,41,100,'Low tom',eov
+map$8:	db	no,0,42,100,'Closed high hat',eov
+map$9:	db	no,0,45,100,'Mid tom',eov
+map$10:	db	no,0,46,100,'Open high hat',eov
+map$11:	db	no,0,48,100,'High tom',eov
+map$12:	db	no,0,49,100,'Crash cymbal',eov
+map$13:	db	no,0,51,100,'Ride cymbal',eov
+map$14:	db	no,0,54,100,'Tambourine',eov
+map$15:	db	no,0,56,100,'Cowbell',eov
+map$16:	db	yes,1,60,100,'JX8P 1',eov
+map$17:	db	yes,1,70,100,'JX8P 2',eov
+map$18:	db	yes,1,80,100,'JX8P 3',eov
+map$19: db	yes,1,90,100,'JX8P 4',eov
+map$20:	db	yes,1,72,100,'JX8P 5',eov
+map$21:	db	yes,1,73,100,'JX8P 6',eov
+map$22:	db	yes,1,74,100,'JX8P 7',eov
+map$23: db	yes,1,75,100,'JX8P 8',eov
+map$24:	db	yes,1,72,100,'JX8P 9',eov
+map$25:	db	yes,2,73,100,'JX8P 10',eov
+map$26:	db	yes,3,74,100,'JX8P 11',eov
+map$27: db	yes,4,75,100,'JX8P 12',eov
+	db	eotbl		; end of table delimiter
+
+; the drum table contains the corresponding entries above
+; to be sent out when the pad is triggered. More than one
+; voice can be triggered by one pad by just adding more
+; numbers to the following lines. The entries above should
+; have different Midi channels though.
+
+pad$tbl:
+
+
+; $$$$$%$&$ the two eotbl should only be only one after the
+; temporary editor is changed $$$$$$$$$$$$$$$$$$$$$
+
+
+pad$1:	defb	1,16,eotbl	; bass drum 1 + jx8p-1
+pad$2:	defb	4,eotbl,eotbl	; Snare 1
+pad$3:	defb	3,eotbl,eotbl	; Rim shot
+pad$4:	defb	7,17,eotbl	; Low tom
+pad$5:	defb	9,18,eotbl	; Mid tom
+pad$6:	defb	11,19,eotbl	; High tom
+pad$7:	defb	5,eotbl,eotbl	; handclap
+pad$8:	defb	8,eotbl,eotbl	; closed high hat
+pad$9:	defb	10,eotbl,eotbl	; open high hat
+
+; Default footswitch midi mapping
+
+foot$1:	defb	1,12,eotbl	; bass drum 1 and crash
+
+drum$info$length equ $-drum$vec$tbl
+
+; ----------------------------------------------------------
+
+; ------->>>	Enable drum pad and footswitch interrupts
+
+enable$drum:
+
+enable$2:call	print$string
+	defb	cr,lf,'Use <D>efault rom map or <R>am cartridge map?',eot
+	call	echo
+	push	af
+	call	crlf
+	pop	af
+	cp	'D'
+	jr	z,use$default
+	cp	'R'
+	jr	nz,enable$2
+
+	call	cart$check
+	jr	nc,a$cart
+	call	print$string
+	defb	'Drum Pad Enable aborted.',cr,lf,eot
+	jp	midi$prompt
+
+a$cart:	ld	hl,ram$pack$data$start ; Jx8p cartridge in computer now
+	jr	str$add
+
+use$default:
+	ld	hl,drum$vec$tbl
+str$add:ld	(drum$tbl$addr),hl
+
+
+	ld	hl,midi$drumpad$handler
+	ld	(1+drumpad$vector),hl
+	ld	hl,midi$footswitch$handler
+	ld	(1+footswitch$vector),hl
+	ld	a,0c3h
+	ld	(drumpad$vector),a
+	ld	(footswitch$vector),a
+
+	ld	hl,pio$a$handler
+	ld	(vec$tbl$abs$loc + piovec1),hl
+	ld	hl,pio$b$handler
+	ld	(vec$tbl$abs$loc + piovec2),hl
+
+	di
+	ld	c,pa$ctrl
+	ld	b,pio$a$length
+	ld	hl,pio$a$tbl
+	otir			; send to PIO A control register
+
+	ld	c,pb$ctrl
+	ld	b,pio$b$length
+	ld	hl,pio$b$tbl
+	otir			; send to PIO B control register
+
+	ei
+	jp	midi$prompt
+
+
+pio$a$tbl:	; *** Active level is high
+
+	defb	11001111b	; set to mode 3 input
+	defb	11111111b	; define all to be input
+	defb	10110111b	; set interrupt mode (OR, Active low)
+	defb	00111111b	; only interrupt on bit 6 and 7
+	defb	(pio$vectors - ((pio$vectors / 256) * 256)) ; send LSB of vector address
+
+pio$a$length	equ	$-pio$a$tbl
+
+pio$b$tbl:	; *** Port Bus attached to drum interface connector
+		; *** Active Level is high
+
+	defb	11001111b	; set to mode 3 input
+	defb	11111111b	; define all to be input
+	defb	10110111b	; set interrupt mode (OR, Active High)
+	defb	00000000b	; define all bits to interrupt
+	defb	((pio$vectors+2) - (((pio$vectors+2) / 256) * 256)) ; send LSB of vector address
+
+pio$b$length	equ	$-pio$b$tbl
+
+; ------->>>	Disable drum pad and footswitch interrupts
+
+disable$drum:
+
+	ld	a,00000011b	; disable interrupt register
+	out	(pa$ctrl),a	; send to pio A
+	out	(pb$ctrl),a	; send to pio B
+	ld	a,0c9h		; put in return for the vectors
+	ld	(drumpad$vector),a
+	ld	(footswitch$vector),a
+
+	jp	midi$prompt
+
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+;	monitor command action routines package
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+.comment\
+
+To detemine baud rate values:
+----------------------------
+
+   These are determined by 2Mhz clock, x16 prescaler.
+
+   Time period is 2e6/16/baudrate
+
+   Say answer is 104 (decimal), then LSB = 04, MSB =01
+   (not hex!)
+
+Baud
+Rate 150 300 600 1200 2400 3600 4800 7200 9600 19200 31250
+--------------------------------------------------------------
+LSB   33  17  08   04   52   35   26  17    13    06    04
+MSB   08  04  02   01   00   00   00  00    00    00    00    \
+
+
+setbaud:call	print$string
+	defm	'0) 150 1) 300 2) 600 3) 1200 4) 2400 5) 3600 6) 4800 7) 7200 8) 9600 9) 31250',cr,lf
+	defm	'Which baud rate for the RS-232 port? '
+	defb	eot
+getin:	call	kbdin
+	cp	'0'
+	jr	c,getin
+	cp	'9'+1
+	jr	nc,getin
+	sub	'0'
+	cp	9
+	jr	nz,not9
+	inc	a		; offset 31250 to correct table location
+not9:	push	af
+	call	crlf
+	pop	af
+setbd1:
+	sla	a		; init jumps here
+	ld	d,0
+	ld	e,a
+	ld	hl,baudtbl
+	add	hl,de
+
+	ld	a,37h		; Read/Load Lsb then MSB of counter 0
+	out	(counter$ctrl),a
+	ld	a,(hl)		; get LSB
+	out	(counter$0),a
+	inc	hl
+	ld	a,(hl)
+	out	(counter$0),a	; send MSB
+
+	ret
+
+baudtbl:defb	33h,8 		; 150
+	defb	17h,4 		; 300
+	defb	08h,2 		; 600
+	defb	04h,1 		; 1200
+	defb	52h,0 		; 2400
+	defb	35h,0		; 3600
+	defb	26h,0		; 4800
+	defb	17h,0		; 7200
+	defb	13h,0		; 9600
+	defb	06h,0		; 19200
+	defb	04h,0		; 31250
+
+;	-- Print time and date from real time clock
+
+snd$timdat:
+	call	crlf
+	ld	c,0		; time and date function
+	call	rst$system$driver
+	call	crlf
+	ret
+
+;	-- Set up Real Time clock parameters
+
+setclock:
+	call	crlf
+	ld	c,1		; setclock function
+	call	rst$system$driver
+	call	crlf
+	ret
+
+; Toggle between LCD and RS-232 outputs
+
+toggle$display:
+	ld	a,(lcd$rs232)		; get flag
+	cpl				; complement it
+	ld	(lcd$rs232),a		; and put it back
+
+	ld	a,(lcd$rs232)
+	or	a
+	jr	nz,tog2			; RS-232
+
+	call	lcd$clear
+
+tog2:	ret
+
+;	-- Xmodem receive to memory
+
+; HL = start address
+
+rec$xmodem:	dec	a
+		scf
+		ret	nz		; ret is > 1 parameters
+
+		ld	a,1		; receive to memory
+		call	start$xmodem
+		jp	xmo2		; go tell user we're done
+
+;	-- Xmodem send from memory
+
+; HL = start address
+; DE = end address
+
+send$xmodem:	cp	2
+		scf
+		ret	nz		; ret if > 2 parameters
+
+		ld	a,0		; send from memory
+
+		push	hl		; save start address
+		ex	de,hl
+		sbc	hl,de		; get length-1
+		jp	m,error		; error if count is -ve
+		push	hl
+		pop	bc
+		pop	hl
+start$xmodem:	ld	de,xmo$ret
+		jp	xmodem
+
+xmo$ret:	ld	sp,mstack	; redo stack
+		scf
+		ccf
+xmo2:		call	speak
+		defm	'TRANSFER FINISHED',eot
+		jp	prompt		; and return to main menu
+
+;	-- memory dump command --
+
+memdmp:	dec	a		;check parameter count
+	jr	z,mdmp2		;first parameter
+	dec	a
+	jr	z,mdmp3		;second parameter ..end address
+mdmp1:	ld	hl,(last)
+mdmp2:	ld	de,16
+	jr	mdmp3b
+
+mdmp3:	ex	de,hl
+	sbc	hl,de		;derive bytecount for dump range
+	ld	b,4
+mdmp3a:	srl	h		;divide bytecount by 16
+	rr	l
+	djnz	mdmp3a
+	inc	hl
+	ex	de,hl
+mdmp3b:	call	dump		;dump de*16 bytes strting at hl
+	ld	(last),hl
+	ret
+
+;	-- de has length of dump
+;	-- hl has starting address
+
+dump:	push	hl		;save starting address
+	call	put4hs		;print starting address in hex
+	ld	a,' '
+	call	output
+
+	ld	b,16
+dump2:	ld	a,(hl)		;get a data byte @ hl
+	inc	hl
+	call	put2hs		;print the data in hex
+	djnz	dump2		;repeat 16 times
+
+	pop	hl		;restore starting address
+	ld	b,16
+dump3:	ld	a,(hl)		;get back data byte @ hl
+	inc	hl
+	res	7,a		; zero high bit
+;	cp	07fh
+;	jr	z,dump4		; don't display ascii del
+	cp	07eh	; don't display del or tilde
+	jr	nc,dump4 ; because of problems with some terminals
+	cp	20h
+	jr	nc,dump5
+dump4:	ld	a,'.'		;print a dot if data < 20h or ascii del
+dump5:	push	hl
+	call	output		;print ascii character in a
+	pop	hl
+	ret	nz		; ret if esc pressed
+	djnz	dump3
+
+	call	crlf
+	ret	nz		;exit if escape request is indicated
+	dec	de
+	ld	a,d
+	or	e
+	jr	nz,dump
+	ret
+
+;	-- memory examine command --
+
+view:	call	mdata
+	call	echo
+	cp	cr
+	jr	z,view4
+	cp	'-'
+	jr	z,view5
+view2:	call	aschex
+	ccf
+	ret	nc
+	rlca
+	rlca
+	rlca
+	rlca
+	ld	c,a
+	call	echo
+	call	aschex
+	ccf
+	ret	nc
+	or	c
+view3:	ld	(hl),a
+	call	check
+view4:	inc	hl
+	inc	hl
+view5:	dec	hl
+	jr	view
+
+;	-- jump to memory location command --
+
+goto:	dec	a		;check parameter count
+	scf
+	ret	nz
+	push	hl
+	pop	ix
+	call	callx		;call address passed in hl
+	or	a
+	ret			;return if we get back again
+
+;	-- memory read/write diagnostic command --
+
+test:	cp	2		;check parameter count
+	scf
+	ret	nz		; test is done in 256 byte blocks
+	inc	de		;de  contains param2 end address
+	ld	e,d		;get ending page address into e
+	ld	d,h		;get starting page address into d
+	ld	b,0		;initialize pass counter
+test1:	ld	h,d		;point hl to start of block
+	ld	l,0
+test2:	ld	a,l
+	xor	h		;generate test byte
+	xor	b
+	ld	(hl),a		;--store test byte in ram--
+	inc	hl
+	ld	a,h
+	cp	e		;check for end of test block
+	jr	nz,test2
+;				now read back each byte & compare
+	ld	h,d
+	ld	l,0		;point hl back to start
+test3:	ld	a,l
+	xor	h		;re-generate test byte data
+	xor	b
+	call	check		;verify memory data still good
+	ret	nz		;exit if escape request is indicated
+	inc	hl		; else go on to next byte
+	ld	a,h
+	cp	e		;check for end of block
+	jr	nz,test3
+	inc	b		;bump pass count
+	ld	a,'+'
+	call	output		;print '+' and allow for exit
+	jr	z,test1		;do another pass if no escape
+	ret
+
+check:	cp	(hl)
+	ret	z		;return if (hl)=a
+	push	af
+	call	mdata		;print what was actually read
+	call	print$string
+	defm	'should='
+	defb	eot
+	pop	af
+	jp	put2hs		;print what should have been read
+
+mdata:	call	crlf
+	call	put4hs
+	ld	a,(hl)
+	jp	put2hs
+
+;	-- fill memory with constant command --
+
+fill:	cp	3		;check if parameter count=3
+	scf
+	ret	nz
+fill1:	ld	(hl),c
+	push	hl
+	or	a
+	sbc	hl,de		;compare hl to end address in de
+	pop	hl
+	inc	hl		;advance pointer after comparison
+	jr	c,fill1
+	ret
+
+;	-- memory block move command --
+
+block:	cp	3		;check if parameter count=3
+	scf
+	ret	nz
+	call	blocad
+	ld	a,c
+	or	b
+	ret	z		;exit now if bc=0
+	ldir
+	ret
+
+blocad:	ex	de,hl
+	or	a		;clear carry
+	sbc	hl,de		;get difference between
+	ex	de,hl		;hl & de for bytecount
+	push	de
+	push	bc
+	pop	de		;get old bc into de
+	pop	bc
+	inc	bc		;get count+1 into bc
+	ret
+
+;	-- read from input port command --
+
+incmd:	dec	a		;check if parameter count=1
+	scf
+	ret	nz
+	ld	c,l		;point c to input port
+in1:	call	crlf
+	ld	a,c		; get port number
+	call	put2hs		; print port number
+	in	a,(c)		; get byte from port
+	call	put2hs		; and print it
+	call	echo
+	cp	cr
+	jr	z,in2
+	cp	'-'
+	jr	z,in3
+	cp	08
+	jr	z,in3
+	or	a
+	ret
+
+in2:	inc	c
+	inc	c
+in3:	dec	c
+	jr	in1
+
+;	-- write to output port command --
+
+outcmd:	cp	2		;check if parameter count=2
+	scf
+	ret	nz
+	ld	c,l		;point c to output port
+	out	(c),e		;output data passed in e
+	or	a
+	ret
+
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+;	console i/o package and utility routines
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+; Input an 80 char line pointed to by HL
+
+getlin:	ld	b,c		;save max line length parameter in b
+glin1:	call	echo		;get a character from the console
+	cp	cr		;check for carriage return
+	jr	z,glin2
+	cp	BS		;check for ctl-h backspace
+	jr	z,glin4
+	cp	' '
+	ret	c		;other control characters are illegal
+	ld	(hl),a
+	inc	hl		;store character in buffer
+	dec	c
+	jr	nz,glin1	;get another if there's more room
+	scf
+	ret			;return with carry=1 if too
+				;many characters are entered
+glin2:	ld	(hl),a		;put carriage return on end of line
+	ret			;return with carry bit=0
+
+glin4:	dec	hl		;delete last character from buffer
+	call	print$string
+	defb	' ',BS,eot	;print a space to overwrite the last char
+	inc	c
+	ld	a,b		;make sure you're not trying to
+	sub	c		;backspace past the start of the line
+	jr	nc,glin1
+	ret
+
+; Search table at HL for match with AL
+
+search:	cpir			;search table @hl for match with a
+	ret	nz		;exit now if search fails
+	add	hl,bc
+	add	hl,bc		;add residue from cpir bytecount
+	add	hl,bc		; to hl 3 times to get pointer
+	ld	c,(hl)		; to address part of table entry
+	inc	hl
+	ld	b,(hl)
+	ret			;exit with z=1 to indicate match
+
+; Get 4 paramters from command line and set parameter count
+
+params:	ld	bc,0
+	ld	a,(iy+0)
+	cp	cr		;check if line terminates
+	jr	nz,para2	; immediately with a return
+	xor	a
+	ret			;return with param count=0 if so
+
+para1:	inc	c
+	inc	c
+	bit	3,c
+	scf
+	ret	nz		;error if > 4 numbers entered
+para2:	push	bc		;save parameter count
+	call	gethex		;read a number from line buffer
+	pop	bc
+para4:	ret	c		;error if result over 16 bits
+	ld	ix,param1	;point to parameter storage area
+	add	ix,bc		;add parameter count in bc
+	ld	(ix+0),l
+	ld	(ix+1),h	;store data returned from 'gethex'
+	cp	' '
+	jr	z,para1		;get another item if space
+	cp	','
+	jr	z,para1		;get another item if comma
+	cp	cr
+	scf			;else check for carriage return
+	ret	nz		; and exit with cy=1 if not
+parend:	ld	a,c
+	srl	a		;a=count of numbers entered
+	inc	a
+	ret
+
+; print 'A' spaces
+
+print$spaces:
+
+	push	bc
+	ld	b,a
+prt$spc:ld	a,' '
+	call	crtout
+	djnz	prt$spc
+	pop	bc
+	ret
+
+; -----------------------------------------------------------
+; Input a 5 byte numeric string to line buffer. Only characters
+; 1-9 are allowed and 5 characters allowed input.
+
+; Input: HL = input buffer to store string
+
+; Output: Max 5 chars placed in 'LINBUF' followed by 0.
+
+; Registers destroyed: B,A
+
+; -----------------------------------------------------------
+
+inp$dec:ld	b,5		; set length (4 bytes max)
+
+geth:	call	kbdin
+geth1:	cp	8
+	jr	z,do$bs
+	cp	07fh		; rubout?
+	jr	z,do$bs
+	ld	(hl),a
+	inc	hl
+	ld	(hl),0		; put in delimeter for conv.
+	dec	hl
+	cp	cr
+	ret	z
+	inc	b
+	dec	b
+	jr	z,geth
+	cp	'0'
+	jr	c,geth
+	cp	'9'+1
+	jp	nc,geth
+	call	crtout
+	inc	hl
+	dec	b
+	jr	geth
+
+do$bs:	ld	a,b
+	cp	5
+	jr	z,geth
+	inc	b
+	ld	a,8
+	call	crtout
+	ld	a,32
+	call	crtout
+	ld	a,8
+	call	crtout
+	ld	(hl),0
+	dec	hl
+	jr	geth
+
+; -----------------------------------------------------------
+; Convert the decimal string digits pointed to by HL to binary
+; number in DE. Convertion continues until CR,LF,00 or
+; non-ASCII character reached, or over-flow.
+
+; Input:  HL points to string to convert (ie. linbuf)
+
+; Output: DE is converted number
+;	  A = 0 if only cr/lf pressed, ff = otherwise
+;	  Carry set if over-flow or non-numeric digit found
+; -----------------------------------------------------------
+
+asc$dec:
+	push	bc
+	ld	de,0		; converted number = 0
+	ld	a,(hl)
+	cp	cr
+	jr	z,cr$hit
+	cp	lf
+	jr	nz,get$num
+
+cr$hit:	ld	a,0		; indicate CR or LF only pressed
+	jr	done1
+
+;  Get next digit and check for '0' - '9'
+
+get$num:ld	a,(hl)
+	cp	00
+	jr	z,done
+	cp	cr
+	jr	z,done
+	cp	lf
+	jr	z,done
+	sub	'0'
+	jr	c,error2
+	cp	10
+	jr	nc,error2
+
+	push	af
+
+;  Multiply DE by 10 to make room for new digit
+
+	push	hl	; save hl
+	push	de
+	pop	hl
+	add	hl,hl	; *2
+	add	hl,hl	; *4
+	add	hl,de	; *5
+	add	hl,hl	; *10
+	ex	de,hl
+	pop	hl
+
+;  Add in new ones digit
+
+	pop	af	; get latest digit
+	add	a,e
+	ld 	e,a
+	ld 	a,d	; add carry to d if necessary
+	adc	a,0
+	jr	c,error2 ; greater then 65535, so report error
+	ld 	d,a	; and store the result
+
+;  go onto the next ascii digit
+
+	inc	hl	; point to next ascii character
+	jp 	get$num
+
+;  Done -- Result already in DE
+
+done:	ld	a,0ffh
+	ld 	a,e
+done1:	scf
+	ccf
+	pop	bc
+	ret
+
+error2:	pop	bc		; error found in input
+	scf
+	ret
+
+; ------------------------------------------------
+; Decimal Output routine
+
+;  Input: HL is binary number to be output
+
+; ------------------------------------------------
+
+dec$out:push	bc
+	push	hl
+	push	de
+	ld	bc,-10
+	ld	de,-1		; counts tens digits in number
+decot2:	add	hl,bc
+	inc	de		; inc. tens digit
+	jr	c,decot2
+	ld	bc,10
+	add	hl,bc
+	ex	de,hl
+	ld	a,h
+	or	l
+	call	nz,dec$out
+	ld	a,e
+	add	a,'0'
+	call	crtout
+	pop	de
+	pop	hl
+	pop	bc
+	ret
+
+; --------------------------------------------
+; Gethex converts ascii to binary.
+;
+; 	Carry set on illegal conversion result
+; 	Terminating character returns in a.
+; 	Hl returns with 16 bit binary integer
+; --------------------------------------------
+
+gethex:	ld	hl,0
+	jr	gnum3
+
+gnum1:	ld	b,4
+gnum2:	add	hl,hl		;multiply result by 16
+	ret	c		;return if it overflows 16 bits
+	djnz	gnum2
+	ld	e,a		;append new low order digit
+	ld	d,0		;and get result back into de
+	add	hl,de
+	ret	c		;return if overflow
+gnum3:	ld	a,(iy+0)	;get a character from line input
+	inc	iy		; buffer @ iy and bump iy
+	ld	c,a
+	call	aschex		;convert ascii to numeric
+	jr	nc,gnum1
+	ld	a,c
+	or	a
+	ret
+
+; Convert A from ASC to binary
+
+aschex:	sub	'0'
+	ret	c
+	cp	10
+	ccf
+	ret	nc		; return if 0-9
+	sub	7
+	cp	10
+	ret	c		; return if a-f
+	cp	16
+	ccf
+	ret
+
+; Output HL as HEX string
+
+put4hs:	ld	a,h
+	call	put2hx
+
+; Output L as HEX string
+
+	ld	a,l
+put2hs:	call	put2hx
+	ld	a,' '
+	jp	output
+
+put2hx:	push	af
+	rra
+	rra
+	rra
+	rra
+	call	putnib
+	pop	af
+putnib:	and	00001111b
+	add	a,90h
+	daa
+	adc	a,40h
+	daa
+	jp	output
+
+; PRINT$STRING prints the string of ascii characters
+; pointed to by the relative address in de
+; until an eot is encountered in the string.
+
+print$string:
+pr$string:
+	ex	(sp),hl
+	push	af
+	call	pmsg
+	pop	af
+	ex	(sp),hl
+	ret
+
+; PMSG prints an ASCII string pointed by HL to the output device
+
+pmsg:	ld	a,0
+	ld	(escflg),a
+pmsg1:	ld	a,(hl)
+	inc	hl
+	cp	eot
+	ret	z
+	call	output
+	ld	a,(escflg)	; quit early if return hit
+	cp	cr
+	jr	nz,pmsg1
+get$end:ld	a,(hl)
+	inc	hl
+	cp	eot
+	jr	nz,get$end
+	ret
+
+; The same as above but the output will go purely to the RS-232 port
+
+pr$string$rs232:
+	ex	(sp),hl
+	push	af
+	call	pmsg$rs232
+	pop	af
+	ex	(sp),hl
+	ret
+
+; The same as above but the output will go purely to the RS-232 port
+
+pmsg$rs232:
+	ld	a,0
+	ld	(escflg),a
+pmsg1b:	ld	a,(hl)
+	inc	hl
+	cp	eot
+	ret	z
+	call	output$rs232
+	ld	a,(escflg)	; quit early if return hit
+	cp	cr
+	jr	nz,pmsg1b
+get$end2:ld	a,(hl)
+	inc	hl
+	cp	eot
+	jr	nz,get$end2
+	ret
+
+; The same as above but the output will go purely to the LCD screen
+
+pr$string$lcd:
+	ex	(sp),hl
+	push	af
+	call	pmsg$lcd
+	pop	af
+	ex	(sp),hl
+	ret
+
+; The same as above but the output will go purely to the LCD screen
+
+pmsg$lcd:
+	ld	a,0
+	ld	(escflg),a
+pmsg1c:	ld	a,(hl)
+	inc	hl
+	cp	eot
+	ret	z
+	push	hl
+	call	lcdout
+	pop	hl
+	ld	a,(escflg)	; quit early if return hit
+	cp	cr
+	jr	nz,pmsg1c
+get$end3:ld	a,(hl)
+	inc	hl
+	cp	eot
+	jr	nz,get$end3
+	ret
+
+; CRLF outputs a return-linefeed to the console device
+
+crlf:	call	print$string
+	defb	cr,lf,eot
+	ret
+
+; Echo inputs one character from the console
+; device, prints it on the console output and
+; then returns it in register a with bit 7 reset
+
+; Output prints the character in register a on
+; the console output device and then does a check
+; for console input to freeze or abort output.
+
+echo:	call	kbdin		;input a character and echo it
+	cp	07fh		;is it delete character?
+	jr	nz,ok
+	ld	a,08h		;replace delete with backspace
+ok:	push	af
+	call	crtout
+	pop	af
+	cp	'Z'+1
+	ret	c
+	sub	20h		;convert lower case to upper case
+	ret
+
+output:	call	crtout
+	call	kbdst		;see if console input is pending
+	jr	z,outp2
+	call	kbdin
+	cp	cr		;see if carriage return was typed
+	jr	z,outp1
+	call	kbdin		;wait for another input character
+	jr	outp2		; then return to calling routiarriage return was typed
+
+outp1:	ld	(escflg),a	;set escape flag to non-zero value
+outp2:	ld	a,(escflg)
+	or	a
+	ret
+
+; The same as above but the output will go purely to the RS-232 port
+
+output$rs232:
+	call	out232b
+	call	kbdst		;see if console input is pending
+	jr	z,outp2b
+	call	kbdin
+	cp	cr		;see if carriage return was typed
+	jr	z,outp1b
+	call	kbdin		;wait for another input character
+	jr	outp2b
+
+outp1b:	ld	(escflg),a	;set escape flag to non-zero value
+outp2b:	ld	a,(escflg)
+	or	a
+	ret
+
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+;	console i/o dispatchers, drivers and routines
+; =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+; ------------------ ReStarT I/O Driver ---------------------
+
+; Inputs: C  = function number
+;	  DE = passing paramter register
+;	  A  = character to send (optional for some)
+
+; Ouputs: A  = character received (optional for some)
+;	  DE = return passing parameters
+;	  Carry set if error
+
+; When adding more vectors, use 'ld a,l' before doing jump.
+
+rst$io$driver:
+		push	bc
+		push	de
+		push	hl
+		push	af
+		ld	l,a		; save parameter
+		ld	a,c
+		cp	10h
+		ld	a,l		; restore parameter
+		jp	c,lcd$driver	; 0->f = lcd driver
+		ld	a,c
+		cp	20h
+		ld	a,l		; restore parameter
+		jp	c,led$driver	; 10->1f = led driver
+		ld	a,c
+		cp	24h
+		ld	a,l		; restore parameter
+		jp	c,driv20up	; 20->23 = Centronics printer driver (+ others)
+
+; *** for other drivers, dont forget to minus the offset
+; before creating an offset into the vector tables!!!
+
+rst$io$error:	pop	af		; error found, set
+		scf			; carry flag
+		jr	rst$io$2
+
+rst$io$ret:	pop	af		; no error found, reset
+		scf			; carry flag
+		ccf
+
+rst$io$2:	pop	hl
+		pop	de
+		pop	bc
+		scf
+		ccf
+		ret
+
+; :::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+; I/O driver for functions 20h and up....
+
+driv20up:	ld	b,a		; save A
+		push	de
+		ld	a,c
+		sub	020h		; subtract offset to these functions
+		sla	a		; make word long
+		ld	e,a
+		ld	d,0
+		ld	hl,table20
+		add	hl,de
+		ld	e,(hl)
+		inc	hl
+		ld	d,(hl)
+		ld	hl,rst$io$ret	; exchange DE and return addr
+		ex	(sp),hl
+		ex	de,hl
+		ld	a,b		; restore A
+		jp	(hl)
+
+table20:	defw	cen$init	; initialize Centronics port
+		defw	cen$ost		; Return Centronics port status
+		defw	cen$out		; Send A to Centronics port
+
+; ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+; I/O functions 0 - 0fh
+
+lcd$driver:	ld	b,a		; save A
+		push	de		; save lcd #
+		ld	a,c
+		sla	a		; make word long
+		ld	e,a
+		ld	d,0
+		ld	hl,lcd$table
+		add	hl,de
+		ld	e,(hl)
+		inc	hl
+		ld	d,(hl)
+		ld	hl,rst$io$ret	; exchange DE and return addr
+		ex	(sp),hl
+		ex	de,hl
+		ld	a,b		; get back A
+		jp	(hl)
+
+; :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+led$driver:	ld	b,a		; save it
+		push	de
+		ld	a,c
+		sub	10h
+		sla	a		; make word long
+		ld	e,a
+		ld	d,0
+		ld	hl,led$table
+		add	hl,de
+		ld	e,(hl)
+		inc	hl
+		ld	d,(hl)
+		ld	hl,rst$io$ret	; exchange DE and return addr
+		ex	(sp),hl
+		ex	de,hl
+		ld	a,b		; get back parameter
+		jp	(hl)
+
+led$table:	defw	display$de
+		defw	colon$on
+		defw	colon$off
+		defw	dec$on
+		defw	dec$off
+		defw	led$clear
+		defw	dis$a
+		defw	dis$asc
+
+; display DE as decimal number, left justified
+
+display$de:	call	led$clear	; clear & program display
+		exx
+		push	de
+		ld	e,0		; start write at left side
+		exx
+		ex	de,hl
+		call	led$dec$out
+		exx
+		pop	de
+		exx
+		ret
+
+led$dec$out: 	push	hl
+		push	de
+		ld	bc,-10
+		ld	de,-1		; counts tens digits in number
+led$decot2:	add	hl,bc
+		inc	de		; inc. tens digit
+		jr	c,led$decot2
+		ld	bc,10
+		add	hl,bc
+		ex	de,hl
+		ld	a,h
+		or	l
+		call	nz,led$dec$out
+		ld	a,e
+		exx
+		call	dis$asc
+		inc	e
+		exx
+		pop	de
+		pop	hl
+		ret
+
+; Turn one, or both of colons on
+
+colon$on:	ld	d,0		; display turn on code
+		jr	change$colon
+
+; Turn one or both colons off
+
+colon$off:	ld	d,0ffh		; display turn off code
+
+change$colon:	ld	a,e
+		and	3
+		cp	2
+		jr	nz,try$left$colon
+		call	left$colon	; turn on/off left & right colon
+		jp	right$colon
+
+try$left$colon:	cp	0
+		jr	nz,right$colon
+left$colon:	ld	a,96h
+		out	(key$ctrl),a
+		ld	a,d
+		out	(key$data),a
+		ret
+
+right$colon:	ld	a,97h
+		out	(key$ctrl),a
+		ld	a,d
+		out	(key$data),a
+		ret
+
+; Turn on one of the decimal points on, E = digit number
+
+dec$on:		call	get$led$data
+		and	0f7h
+		jp	dis$a		; send to display
+
+; Turn off one of the decimal points, E = digit number
+
+dec$off:	call	get$led$data
+		or	8
+		jp	dis$a		; send to display again
+
+; return data in ram at address E, return with char in A
+
+get$led$data:	ld	a,e
+		and	7
+		or	01110000b
+		out	(key$ctrl),a	; issue read command
+		in	a,(key$data)
+		ret
+
+; Clear the LED display  program for auto-inc left entry
+; NOTE: left entry mode setup during keyboard initialization
+
+led$clear:	ld	a,11011100b	; issue clear display
+		out	(key$ctrl),a
+wait$done:	in	a,(key$ctrl)	; wait till all cleared
+		and	080h
+		jr	nz,wait$done
+		ld	a,10010000b	; set to write, auto-inc
+		out	(key$ctrl),a
+		ret
+
+; Write register A at position E (e=0 = left side)
+
+dis$a:		push	af
+		ld	a,e
+		and	7		; max position
+		or	10010000b	; auto-inc, write ram
+		out	(key$ctrl),a	; send command
+		pop	af
+		out	(key$data),a
+		ret
+
+; Display register A as numeric digit (0-9) at E
+
+dis$asc:	push	de
+		push	hl
+		ld	e,a
+		ld	d,0
+		ld	hl,num$table
+		add	hl,de
+		ld	a,(hl)
+		pop	hl
+		pop	de
+		jp	dis$a
+
+; this is the numeric mapping of binary to led digit segments
+
+num$table:	defb	0ch,9fh,4ah,0bh,99h,29h,28h,8fh,09h,89h
+
+; ------------------- RS-232 ReStarT Driver ----------------------
+
+; Inputs: C  = function number (0...)
+;	  A  = character to send (optional for some)
+
+; Ouputs: A  = character received (optional for some)
+
+rst$rs232$driver:
+
+		push	bc
+		push	hl
+		ld	hl,sys$ret
+		push	hl		; push return on stack
+		push	af		; save it
+		ld	a,c		; get function number
+		sla	a		; make word
+		ld	c,a
+		ld	b,0
+		pop	af		; restore it
+		ld	hl,rs$tbl
+		add	hl,bc
+		ld	c,(hl)
+		inc	hl
+		ld	b,(hl)
+		push	bc
+		pop	hl
+		jp	(hl)		; execute routine
+
+rs$tbl:		defw	clear$rs232$buffers
+		defw	kbdst		; return rs-232 input buffer status
+		defw	kbdin		; get character from input buffer
+		defw	crtout
+
+; ------------------- Midi ReStarT Driver ----------------------
+
+; Inputs: C  = function number (0...)
+;	  A  = character to send (optional for some)
+
+; Ouputs: A  = character received (optional for some)
+
+rst$midi$driver:
+
+		push	bc
+		push	hl
+		ld	hl,sys$ret
+		push	hl		; push return on stack
+		push	af		; save it
+		ld	a,c		; get function number
+		sla	a		; make word
+		ld	c,a
+		ld	b,0
+		pop	af		; restore it
+		ld	hl,midi$tbl
+		add	hl,bc
+		ld	c,(hl)
+		inc	hl
+		ld	b,(hl)
+		push	bc
+		pop	hl
+		jp	(hl)		; execute routine
+
+midi$tbl:	defw	clear$midi$buffers
+		defw	midi$status	; return midi input buffer status
+		defw	midi$in		; get character from input buffer
+		defw	midi$out	; send A to midi output
+		defw	midi$err$stat	; get receive error status then reset
+
+; ------------------- System ReSTart Driver -----------------
+
+; Call via monitor jump table in static ram (from external banks)
+
+; Inputs: C  = function number (0...)
+;	  DE = passing parameter register
+;	  A  = character to send (optional for some)
+
+; Ouputs: A  = character received (optional for some)
+;	  DE = return passing parameters
+;	  Carry set if error
+
+rst$system$driver:
+
+		push	bc
+		push	hl
+		ld	hl,sys$ret
+		push	hl		; push return on stack
+		push	af		; save it
+		ld	a,c		; get function number
+		sla	a		; make word
+		ld	c,a
+		ld	b,0
+		pop	af		; restore it
+		ld	hl,sys$tbl
+		add	hl,bc
+		ld	c,(hl)
+		inc	hl
+		ld	b,(hl)
+		push	bc
+		pop	hl
+		jp	(hl)		; execute routine
+
+sys$ret:	pop	hl		; this is also used by the rs-232
+		pop	bc		; and the midi drivers
+		ret
+
+sys$tbl:	defw	prt$tim$dat	; print time and date
+		defw	setup$clock	; get clock parameters
+
+; ----  Clock Routines for MM58167 clock chip located at ----
+; ----  clock$base+16-38 on Colossus computer.           ----
+
+prt$tim$dat:
+	ld	hl,timebuf	; move time and date strings
+	ld	de,linbuf	; into line buffer so we can
+	ld	bc,21		; modify them then print them
+	ldir			; out
+
+	ld	hl,linbuf	;address of time area (timebuf)
+	in	a,(clock$base+4) ;read hours
+	call	convert		;place in buffer
+	inc	hl
+	in	a,(clock$base+3) ;read minutes
+	call	convert		;place in buffer
+	inc	hl
+	in	a,(clock$base+2) ;read seconds
+	call	convert		;place in buffer
+
+	ld	hl,linbuf
+     	call	pmsg		;print out the time
+
+	ld	hl,days		; address of day table
+	in	a,(clock$base+5) ; get day of the week
+	dec	a
+	ld	c,a
+	sla	a		; * 3
+	add	a,c
+	ld	e,a
+	ld	d,0
+	add	hl,de		; get day offset
+	call	sndstr		; print out day
+	ld	a,32
+	call	crtout		; print space
+
+	ld	hl,months 	; address of months table
+	in	a,(clock$base+7); get month
+
+	push	af		; convert decimal number
+	srl	a		; returned by clock chip
+	srl	a		; to binary
+	srl	a
+	srl	a
+	ld	b,a
+	cp	0
+	ld	a,0
+	jr	z,bzero
+adda:	add	a,10
+	djnz	adda
+bzero:	ld	b,a
+	pop	af
+	and	0fh
+	add	a,b
+
+	dec	a
+	ld	c,a
+	sla	a
+	add	a,c
+	ld	e,a
+	ld	d,0
+	add	hl,de		; get month offset
+	call	sndstr		; print out month
+
+	ld	hl,linbuf+12
+	in	a,(clock$base+6) ; get day of the month
+	call	convert
+
+	ld	hl,linbuf+11	; point to modified daybuf
+	call	pmsg		; print modified daybuf
+	ret
+
+sndstr:	call	snds
+	call	snds
+
+snds:   ld	a,(hl)
+	inc	hl
+	jp 	crtout
+
+convert:push	af		; convert # in a to 2 ascii
+	and	0f0h
+	rrca
+	rrca
+	rrca
+	rrca
+	call	hchot2		; form ascii
+	pop	af		; get back char
+	and	0fh		; only right half
+hchot2:	cp	0ah		; need leter?
+	jr	c,hchot3		; no
+	add	a,'a'-03ah	; adjust for a-f
+hchot3: add	a,030h		; make ascii
+	ld	(hl),a		; store away
+	inc	hl
+	ret
+
+timebuf:defb	'00:00:00, ',eot
+daybuf:	defb	' 00 1986.',eot
+
+days:	defb	'SunMonTueWedThuFriSat'
+
+months: defb	'JanFebMarAprMayJunJulAugSepOctNovDec'
+
+; ----- Program the MM58167 Real Time Clock -----
+
+setup$clock:
+	call	print$string
+	defb	'Day of week (1=Sunday, 7=Saturday)? ',eot
+	call	get$dec
+	ld	b,5
+	call	pgm$clock
+	call	print$string
+	defb	cr,lf,'Day of the month? ',eot
+	call	get$dec
+	ld	b,6
+	call	pgm$clock
+	call	print$string
+	defb	cr,lf,'The month (1=January, 12=December)? ',eot
+	call	get$dec
+	ld	b,7
+	call	pgm$clock
+	call	print$string
+	defb	cr,lf,'Hours (24 hour)? ',eot
+	call	get$dec
+	ld	b,4
+	call	pgm$clock
+	call	print$string
+	defb	cr,lf,'Minutes? ',eot
+	call	get$dec
+	ld	b,3
+	call	pgm$clock
+	call	print$string
+	defb	cr,lf,lf,'Press any key to start clock.',eot
+	call	echo		; wait for a key input
+
+	ld	a,0		; reset seconds
+	ld	b,2
+	call	pgm$clock
+	ld	a,0ffh		; send GO command
+	out	(clock$base + 15),a
+	ret
+
+; Input decimal number and convert to binary
+
+get$dec:ld	hl,linbuf
+	ld	b,2		; input 2 bytes
+	call	geth
+	ld	hl,linbuf
+	call	asc$dec
+	jr	c,no$entry
+	ld	a,e
+	ret
+
+no$entry:ld	a,0
+	ret
+
+; the clock chip expects a decimal equivalent of the parameter
+; and not a binary number.
+
+pgm$clock:
+		push	bc
+		push	af
+		ld	c,0
+do$div:		sub	10		; C=int(a/10)
+		jr	c,done$div
+		inc	c
+		jr	do$div
+done$div:	ld	b,c		; B=int(a/10)
+		ld	a,c
+		or	a
+		ld	a,0
+		jr	z,done$mult
+do$mult:	add	a,10		; A=C*10
+		djnz	do$mult
+done$mult:	ld	b,a		; B=int(c/10)*10
+		pop	af
+		sub	b
+		ld	b,a		; B=A-int(c/10)*10
+		ld	a,c		; C=int(c/10)
+		sla	a
+		sla	a
+		sla	a
+		sla	a		; C * 16
+		add	a,b		; A = int(a/10)*16 + B
+		pop	bc
+		push	af
+		ld	a,b		; get port
+		add	a,clock$base	; add offset
+		ld	c,a		; save as port address
+		pop	af		; get argument
+		out	(c),a		; send to port
+		ret
+
+; -----------------------------------------------------------------
+; 	Keyboard, Midi and Centronics Parallel Port Functions
+; -----------------------------------------------------------------
+
+; Centronics Compatible parallel printer port through the 8255
+; These are callable from the rst$io$driver.
+;
+; Initialize 8255 port for a centronics parallel printer.
+
+cen$init:
+	ld	a,cen$init$val		; All except C upper are output.
+	out	(pio$ctrl$8255),a	; initialize 8255 I/O port configuration
+	ld	a,auto$ff or 2		; enable auto-form-feed, keep strobe high
+	out	(pio$c$8255),a		; init auto-ff* and strobe* bits to printer
+	ret
+
+; return Centronics port status (NZ = ready, 00= Z= not ready)
+
+cen$ost:in	a,(pio$c$8255)		; get BUSY status
+	cma
+	and	80h			; check bit 7
+	ret	z
+	ld	a,0ffh
+	or	a			; return ready status
+	ret
+
+; send A to centronics port
+
+cen$out:in	a,(pio$c$8255)		; get BUSY status
+	and	80h			; check bit 7
+	jr	nz,cen$out		; wait for non-busy status
+	ld	a,c
+	out	(pio$a$8255),a		; then send to port
+	ld	a,2			; bring strobe* low, keep auto-ff same
+	out	(pio$ctrl$8255),a
+	nop				; wait at least 500ns
+	ld	a,3			; bring strobe high
+	out	(pio$ctrl$8255),a
+	ret
+
+; Clear RS-232 input and output buffer
+
+clear$rs232$buffers:
+
+	push	hl
+	push	af
+	ld	hl,rs232$input$buffer
+	ld	(rs232$q$start),hl
+	ld	(rs232$q$end),hl
+
+	ld	hl,rs232$send$buffer
+	ld	(rs232$send$q$start),hl
+	ld	(rs232$send$q$end),hl
+
+	xor	a
+	ld	(rs232$bytes$in$q),a
+	ld	(rs232$send$bytes$in$q),a
+	pop	af
+	pop	hl
+	ret
+
+;	get terminal status
+
+kbdst:
+	ld	a,(rs232$bytes$in$q)
+	cp	0
+	ret	z		; ret with a=0 if no char ready
+	ld	a,0ffh
+	or	a
+	ret			; ret with a=ffh if char available
+
+;	Input character from terminal buffer
+;	Serial channel a used for console out
+
+kbdin:
+		push	hl
+		push	bc
+
+		; Blink the heart beat LED every second
+		ld	c, 2
+		ld	hl, 50000
+
+kbdin$loop:
+		dec	hl
+		ld	a,h
+		or	l
+		jr	nz, kbdin$loop2
+		ld	hl, 50000
+
+		dec	c
+		jr	nz, kbdin$loop2
+		ld	c, 2
+
+		; Flip the state of the heart beat LED
+		ld	a,(config$image)	; get config. port image
+		xor 	heartbeat$led
+		ld	(config$image),a	; update config. register image
+		out	(config),a		; send out to configuration register
+
+kbdin$loop2:	call	kbdst
+		jr	z,kbdin$loop
+
+		pop	bc
+		pop	hl
+
+kbdin2:		di
+		push	hl
+		push	de
+
+		ld	de,(rs232$q$start)
+		ld	a,(de)
+		inc	de
+		ld	(rs232$q$start),de
+		push	af
+		ld	hl,rs232$input$buffer + rs232$q$length
+		ld	a,e
+		cp	l
+		jr	nz,not$rs232$end
+		ld	a,d
+		cp	h
+		jr	nz,not$rs232$end
+
+; end of buffer reached, now wrap around to start
+
+		ld	hl,rs232$input$buffer
+		ld	(rs232$q$start),hl
+
+not$rs232$end:	ld	a,(rs232$bytes$in$q)
+		dec	a
+		ld	(rs232$bytes$in$q),a
+		pop	af
+
+		pop	de
+		pop	hl
+		ei
+		ret
+
+; send A either to RS-232 or to the LCD, depending on LCD$RS232 flag
+
+crtout:		push	af		; save character
+		ld	a,(lcd$rs232)
+		or	a
+		jr	nz,out232	; send out to RS-232
+
+; Send A to LCD driver
+
+lcdout1:	pop	af
+lcdout:		ld	c,0		; Display on lcd function
+		jp	rst$io$driver
+
+; Output character to RS-232 (SIO Channel A)
+
+; Either send it directly to the SIO or place in the output buffer
+
+out232b:	push	af
+
+out232:		pop	af
+		push	af
+		push	bc
+		push	de
+		push	hl
+
+		ld	b,a		; save char. to be sent
+
+rs232$full:	ei			; let interrupts through for a moment
+		di
+		ld	a,(rs232$send$bytes$in$q) ; is Queue full?
+		cp	0
+		jr	nz,rs232$not$empty
+
+rs232$empty:	in	a,(sio$a$ctrl)
+		and	4		; is buffer empty?
+		jr	z,rs232$empty
+		ld	a,b		; get data
+		out	(sio$a$data),a
+		jr	rs232$send$ret	; and return to caller
+
+rs232$not$empty:cp	rs232$send$q$length
+		jr	nz,rs232$send$not$full 	; yes, dont enter into queue
+		jr	rs232$full
+
+rs232$send$not$full:
+		inc	a		; inc. number of bytes in queue
+		ld	(rs232$send$bytes$in$q),a  ; and save updated count
+		ld	hl,(rs232$send$q$end)
+		ld	(hl),b
+		inc	hl
+		ld	de,rs232$send$buffer + rs232$send$q$length
+		ld	a,h
+		cp	d
+		jr	nz,rs232$send$not$end
+		ld	a,l
+		cp	e
+		jr	nz,rs232$send$not$end
+		ld	hl,rs232$send$buffer ; point to start of buffer
+rs232$send$not$end:
+		ld	(rs232$send$q$end),hl   ; update end of buffer
+
+rs232$send$ret:	ei
+		pop	hl
+		pop	de
+		pop	bc
+		pop	af
+		ret
+
+; ------------- Z-sio channel B midi I/O routines ------------
+
+; Clear Midi input and output buffers
+
+clear$midi$buffers:
+
+	push	hl
+	push	af
+	ld	hl,midi$input$buffer
+	ld	(midi$q$start),hl
+	ld	(midi$q$end),hl
+
+	ld	hl,midi$send$buffer
+	ld	(midi$send$q$start),hl
+	ld	(midi$send$q$end),hl
+
+	ld	a,false
+	ld	(midi$bytes$in$q),a
+	ld	(midi$send$bytes$in$q),a
+	ld	(midi$receive$error),a	; say no overrun
+	pop	af
+	pop	hl
+	ret
+
+; Return midi$receive$error in A. Called from rst$midi$driver
+; This also resets the receive error status.
+
+midi$err$stat:
+	ld	a,(midi$receive$error)	; pick up the status
+	push	af
+	xor	a
+	ld	(midi$receive$error),a	; then reset the status
+	pop	af
+	ret
+
+; ** before inputting char, check that 'midi$receive$error$ is
+; false
+
+midi$status:
+	ld	a,(midi$bytes$in$q)
+	cp	0
+	ret	z		; ret with a=0 if no char ready
+	ld	a,0ffh
+	or	a
+	ret			; ret with a=ffh if char available
+
+;	get character from 256 byte Midi Buffer
+
+; NOTE: the MIDI$RECEIVE$ERROR flag is not reset if error found
+
+midi$in:	call	midi$status
+		jr	z,midi$in
+
+		di
+		push	hl
+		push	de
+		ld	de,(midi$q$start)
+		ld	a,(de)
+		inc	de
+		ld	(midi$q$start),de
+		push	af
+		ld	hl,midi$input$buffer + midi$q$length
+		ld	a,e
+		cp	l
+		jr	nz,not$midi$end
+		ld	a,d
+		cp	h
+		jr	nz,not$midi$end
+
+; end of buffer reached, now wrap around to start
+
+		ld	hl,midi$input$buffer
+		ld	(midi$q$start),hl
+
+not$midi$end:	ld	a,(midi$bytes$in$q)
+		dec	a
+		ld	(midi$bytes$in$q),a
+		pop	af
+
+		pop	de
+		pop	hl
+		ei
+		ret
+
+; Output character to sio channel b (Midi)
+
+; Either send to SIO if transmit buffer empty or else put it
+;   in the queue.
+
+midi$out: 	push	af
+		push	bc
+		push	de
+		push	hl
+
+		ld	b,a		; save char. to be sent
+
+midi$full:	ei			; let interrupts through for a moment
+		di
+		ld	a,(midi$send$bytes$in$q) ; is Queue full?
+		cp	0
+		jr	nz,midi$not$empty
+
+midi$empty:	in	a,(sio$b$ctrl)
+		and	4		; is buffer empty?
+		jr	z,midi$empty
+		ld	a,b		; get data
+		out	(sio$b$data),a
+		jr	midi$send$ret	; and return to caller
+
+midi$not$empty:cp	midi$send$q$length
+		jr	nz,midi$send$not$full 	; yes, dont enter into queue
+		jr	midi$full
+
+midi$send$not$full:
+		inc	a		; inc. number of bytes in queue
+		ld	(midi$send$bytes$in$q),a  ; and save updated count
+		ld	hl,(midi$send$q$end)
+		ld	(hl),b
+		inc	hl
+		ld	de,midi$send$buffer + midi$send$q$length
+		ld	a,h
+		cp	d
+		jr	nz,midi$send$not$end
+		ld	a,l
+		cp	e
+		jr	nz,midi$send$not$end
+		ld	hl,midi$send$buffer ; point to start of buffer
+midi$send$not$end:
+		ld	(midi$send$q$end),hl   ; update end of buffer
+
+midi$send$ret:	ei
+		pop	hl
+		pop	de
+		pop	bc
+		pop	af
+		ret
+
+; -=-= RS-232 SIO-A Receive Error Interrupt handler =-=-=
+
+rs232$error:	di
+		push	af
+
+		in	a,(sio$a$ctrl)	; kill status
+
+		xor	a		; point at WW0
+		out	(sio$a$ctrl),a
+		ld	a,00110000B
+		out	(sio$a$ctrl),a	; and reset the error condition
+
+		in	a,(sio$a$data)	; kill byte Queue in SIO
+
+rs232$error$ret:pop	af
+		ei
+		reti
+
+; -=-= Midi SIO-B Receive Error Interrupt handler =-=-=
+
+; The error is cleared and the MIDI$RECEIVE$ERROR byte is set
+; to REC$OVERRUN$ERROR
+
+midi$error:	di
+		push	af
+
+		ld	a,rec$overrun$error
+		ld	(midi$receive$error),a
+
+		in	a,(sio$b$ctrl)	; kill status
+
+		xor	a		; point at WW0
+		out	(sio$b$ctrl),a
+		ld	a,00110000B
+		out	(sio$b$ctrl),a	; and reset the error condition
+
+		in	a,(sio$b$data)	; kill byte Queue in SIO
+
+midi$error$ret: pop	af
+		ei
+		reti
+
+
+; =-=-=-=-=-=-= RS-232 Receive Interrupt handler =-=-=-=-=-
+
+rs232$handler:	di
+		push	af
+		push	bc
+		push	de
+		push	hl
+
+		in	a,(sio$a$ctrl)	; get status off SIO stack
+		in	a,(sio$a$data)
+		call	put$in$rs232buf
+
+		pop	hl
+		pop	de
+		pop	bc
+		pop	af
+
+		ei
+		reti			; send EOI to SIO
+
+; this is also called from the keyboard handler
+
+put$in$rs232buf:
+		ld	b,a			; save decoded character
+		ld	a,(rs232$bytes$in$q) 	; is Queue full?
+		cp	rs232$q$length
+		jr	z,rs232$queue$full 	; yes, dont enter into queue
+		inc	a			; inc. number of bytes in queue
+		ld	(rs232$bytes$in$q),a  	; and save updated count
+		ld	hl,(rs232$q$end)
+		ld	(hl),b
+		inc	hl
+		ld	de,rs232$input$buffer + rs232$q$length
+		ld	a,h
+		cp	d
+		jr	nz,rs232$not$end
+		ld	a,l
+		cp	e
+		jr	nz,rs232$not$end
+		ld	hl,rs232$input$buffer ; point to start of buffer
+rs232$not$end:	ld	(rs232$q$end),hl   ; update end of buffer
+
+rs232$queue$full:
+		ret
+
+; =-=-=-=-=-=-= Midi Receive Interrupt handler =-=-=-=-=-
+
+midi$handler:	di
+		push	af
+		push	bc
+		push	de
+		push	hl
+
+		in	a,(sio$b$ctrl)	; get status off SIO stack
+		in	a,(sio$b$data)
+
+		ld	b,a			; save decoded character
+		ld	a,(midi$bytes$in$q) 	; is Queue full?
+		cp	midi$q$length
+		jr	nz,midi$not$full 	; yes, dont enter into queue
+		ld	a,buffer$overrun$error
+		ld	(midi$receive$error),a
+		jr	midi$queue$full
+
+midi$not$full:	inc	a			; inc. number of bytes in queue
+		ld	(midi$bytes$in$q),a  	; and save updated count
+		ld	hl,(midi$q$end)
+		ld	(hl),b
+		inc	hl
+		ld	de,midi$input$buffer + midi$q$length
+		ld	a,h
+		cp	d
+		jr	nz,midi$not$end
+		ld	a,l
+		cp	e
+		jr	nz,midi$not$end
+		ld	hl,midi$input$buffer ; point to start of buffer
+midi$not$end:	ld	(midi$q$end),hl   ; update end of buffer
+
+midi$queue$full:
+		pop	hl
+		pop	de
+		pop	bc
+		pop	af
+
+		ei
+		reti			; send EOI to SIO
+
+; =-=-=-=-=-=-= RS-232 Transmit Interrupt handler =-=-=-=-=-
+
+rs232$int$send:	di
+		push	af
+		push	bc
+		push	de
+		push	hl
+
+		ld	a,(rs232$send$bytes$in$q)
+		cp	0
+		jr	nz,send$r$data
+
+; buffer is empty, tell SIO not to interrupt channel A anymore
+
+		ld	a,00101000b	; stop interrupts
+		out	(sio$a$ctrl),a
+		jr	rs232$send$end	; and return from interrupt
+
+; still data in the buffer, send next character
+
+send$r$data:	ld	de,(rs232$send$q$start)
+		ld	a,(de)
+		inc	de
+		ld	(rs232$send$q$start),de
+		push	af
+		ld	hl,rs232$send$buffer + rs232$send$q$length
+		ld	a,e
+		cp	l
+		jr	nz,not$send$rs232$end
+		ld	a,d
+		cp	h
+		jr	nz,not$send$rs232$end
+
+; end of buffer reached, now wrap around to start
+
+		ld	hl,rs232$send$buffer
+		ld	(rs232$send$q$start),hl
+
+not$send$rs232$end:
+		ld	a,(rs232$send$bytes$in$q)
+		dec	a
+		ld	(rs232$send$bytes$in$q),a
+		pop	af
+		out	(sio$a$data),a
+
+rs232$send$end:	pop	hl
+		pop	de
+		pop	bc
+		pop	af
+
+		ei
+		reti			; send EOI to SIO
+
+; =-=-=-=-=-=-= Midi Transmit Interrupt handler =-=-=-=-=-
+
+midi$int$send:	di
+		push	af
+		push	bc
+		push	de
+		push	hl
+
+		ld	a,(midi$send$bytes$in$q)
+		cp	0
+		jr	nz,send$m$data
+
+; buffer is empty, tell SIO not to interrupt channel B anymore
+
+		ld	a,00101000b	; stop interrupts
+		out	(sio$b$ctrl),a
+		jr	midi$send$end	; and return from interrupt
+
+; still data in the buffer, send next character
+
+send$m$data:	ld	de,(midi$send$q$start)
+		ld	a,(de)
+		inc	de
+		ld	(midi$send$q$start),de
+		push	af
+		ld	hl,midi$send$buffer + midi$send$q$length
+		ld	a,e
+		cp	l
+		jr	nz,not$send$midi$end
+		ld	a,d
+		cp	h
+		jr	nz,not$send$midi$end
+
+; end of buffer reached, now wrap around to start
+
+		ld	hl,midi$send$buffer
+		ld	(midi$send$q$start),hl
+
+not$send$midi$end:
+		ld	a,(midi$send$bytes$in$q)
+		dec	a
+		ld	(midi$send$bytes$in$q),a
+		pop	af
+		out	(sio$b$data),a
+
+midi$send$end:	pop	hl
+		pop	de
+		pop	bc
+		pop	af
+
+		ei
+		reti			; send EOI to SIO
+
+; -=-=-=-=-=-=-=-= SIO A - External Status Interrupt =-=-=-=-=
+; =-=-=-=-=-=-= Keyboard and Keypad Interrupt Handler -=-=-=-=
+
+; This interrupt will occur if there are edge transitions
+; on CTCA*, SYNCA*, DCDA*
+
+; Note: these bits can be high or low, only the transition
+;	causes an interrupt - not the level.
+
+; NOTE:	The 8259's Interrupt request line is attached to
+;	the SYNCA* line currently.
+;
+; Note: If Ctrl or Shift pressed, they are active low
+
+rs232$ext$stat:	di
+		push	hl
+		push	de
+		push	bc
+		push	af
+
+; first, check to see if this is a valid interrupt (the last edge of the
+; rising INT line will cause a SECOND interrupt since the SYNCA* line
+; detects both edges!)
+
+		in	a,(key$ctrl)	; get fifo status byte
+		and	7		; keep # of bytes in fifo
+		jr	z,keybd$return	; false interrupt, return then
+
+		ld	a,040h		; ask for first fifo byte
+		out	(key$ctrl),a
+		in	a,(key$data)	; and pick it up
+		ld	b,a
+
+		in	a,(pa$data)	; look at pio for keypad press
+		and	1
+		jr	z,not$keypad
+
+		ld	hl,keypad$table
+		ld	a,b
+		and	00111000b	; keep scan column
+		srl	a		; make 0-7
+		push	af
+		srl	a
+		srl	a
+		ld	c,a
+		pop	af
+		add	a,c		; * 5
+		jr	decode$keybd$2
+
+not$keypad: 	ld	a,b
+		and	80h
+		jr	nz,not$ctrl
+		ld	hl,control$table
+		jr	decode$keybd
+
+not$ctrl:	in	a,(pa$data)	; look at pio for cap lock
+		and	2
+		jr	nz,not$caplock	; no caplock on, jump
+		ld	a,b
+		and	40h
+		jr	nz,not$cap$shift ; no shift, jump
+		ld	hl,on$shft$caps  ; cap lock  on, shift
+		jr	decode$keybd
+
+not$cap$shift:	ld	hl,on$caps$table ; caps on, no shift
+		jr	decode$keybd
+
+not$caplock:	ld	a,b
+		and	040h
+		jr	nz,not$caps	; jump, no shift
+		ld	hl,off$shft$caps
+		jr	decode$keybd	; shift, cap lock off
+
+not$caps:	ld	hl,off$caps$table ; no shift, no caplock
+
+decode$keybd:	ld	a,b
+		and	00111000b	; keep scan column
+
+decode$keybd$2:	ld	c,a
+		ld	a,b
+		and	7
+		add	a,c
+		ld	e,a
+		ld	d,0
+		add	hl,de
+		ld	a,(hl)
+
+; Before putting it in input buffer, check to see if it is a special
+; purpose key...
+
+		cp	tv$key		; is it the Lcd/RS-232 toggle key?
+		jr	nz,nottv
+		call	toggle$display	; toggle between the Lcd and Rs-232 output
+		jr	keybd$return	; and don't put it in the buffer
+
+nottv:		call	put$in$rs232buf	; place in input buffer
+
+keybd$return:	in	a,(sio$a$ctrl)		; kill status of ext stat. interrupt
+		ld	a,0010000b
+		out	(sio$a$ctrl),a		; and reset the ext status condition
+
+		pop	af
+		pop	bc
+		pop	de
+		pop	hl
+		ei
+		reti
+
+; the keyboard translation tables are external to this program
+
+extrn	keypad$table
+extrn	on$caps$table
+extrn	off$caps$table
+extrn	off$shft$caps
+extrn	on$shft$caps
+extrn	control$table
+extrn	tv$key
+
+;=-=- PIO Interrupt Handler (Drum Pad Inputs and Footswitch) =-=
+
+pio$a$handler:	di		; dont let any interrupts through
+		push	bc
+		ld	c,pa$data
+		jr	check$bits
+
+pio$b$handler:	di
+		push	bc
+		ld	c,pb$data
+
+check$bits:	push	hl
+		push	de
+		push	af
+
+		ld	a,c
+		cp	pa$data
+		jr	nz,get$b$bits
+
+		in	a,(pa$data)
+		ld	b,a
+		and	080h
+		jr	z,try$foot
+		ld	c,8
+		jr	send$info	; trigger drum pad 8
+
+try$foot:	ld	a,b		; see if footswitch pressed
+		and	040h
+		jr	z,pio$ret
+		call	footswitch$vector
+		jr	pio$ret
+
+get$b$bits:	in	a,(pb$data)	; get data from port
+		ld	b,a
+		ld	c,7		; start with pad 7
+decode$bits:	sla	b		; shift next bit to carry
+		jr	c,send$info
+		dec	c		; go to next pad
+		ld	a,0ffh
+		cp	c
+		jr	z,pio$ret	; no high bits, just return
+		jr	decode$bits
+
+send$info:	ld	a,c		; get decoded pad number
+		call	drumpad$vector	; go to drum handling dispatcher
+
+pio$ret:	pop	af
+		pop	de
+		pop	hl
+		pop	bc
+
+		ei		; re-enable the interrupts
+		reti		; tell PIO to return from interrupt
+
+; =-=-=-=-=-=-=-=-= Midi Drum Pads Handler -=-=-=-=-=-=-=-=-
+
+; This is called from the PIO interrupt handler to send
+; proper Midi codes out to the SIO that correspond to the
+; drum pads hit
+
+; Inputs: A = 0-8 corresponding to drum pad hit
+
+; Registers af,bc,de,hl can be destroyed
+
+midi$drumpad$handler:
+
+	sla	a	; * 2
+	ld	e,a
+	ld	d,0
+	ld	hl,(drum$tbl$addr) ; vec$tbl either in ram or rom
+	add	hl,de
+	ld	e,(hl)		; point to one of pad maps
+	inc	hl
+	ld	d,(hl)
+	ex	de,hl
+
+do$next$voice:
+
+	ld	a,(hl)		; get voice # for midi mapping table
+	inc	hl
+	cp	eotbl
+	ret	z		; no more entries in pad table
+	push	hl		; save next table address
+	dec	a
+	sla	a		; make word long
+
+	ld	hl,(drum$tbl$addr)
+	ld	de,20
+	add	hl,de		; point to the midi$map$tbl
+
+	ld	d,0
+	ld	e,a
+	add	hl,de
+	ld	e,(hl)		; pick up address of midi codes
+	inc	hl
+	ld	d,(hl)
+	ex	de,hl
+	call	send$m$info
+	pop	hl
+	jr	do$next$voice
+
+; Send all notes off if desired
+
+send$m$info:
+
+	ld	a,(hl)		; get yes/no
+	inc	hl
+	cp	yes
+	jr	nz,send$drum$note
+
+; send All notes off
+
+	ld	a,(hl)		; get midi channel #
+	and	0fh
+	or	10110000b
+	call	midi$out
+	ld	a,01111011b
+	call	midi$out
+	ld	a,00000000b
+	call	midi$out
+
+; Send note on code
+
+send$drum$note:
+	ld	a,(hl)		; get midi channel #
+	and	0fh
+	or	10010000b
+	inc	hl
+	call	midi$out
+
+; send note
+
+	ld	a,(hl)		; get note on code
+	inc	hl
+	and	07fh		; keep bit 7 low
+	call	midi$out
+
+; send velocity
+
+	ld	a,(hl)		; get note velocity
+	and	07fh		; keep bit 7 low
+	call	midi$out
+	ret
+
+; =-=-=-=-=-=-=-=-= Midi Foot Switch Handler -=-=-=-=-=-=-=-
+
+; This is called from the PIO interrupt handler when the
+; DP-2 footswitch is pressed. This handler sends out an
+; approriate Midi code that simaltes such instruments as
+; Bass drum, hit hat peddle, etc.
+
+; Registers af,bc,de,hl can be destroyed
+
+midi$footswitch$handler:
+
+	ld	a,9		; tenth entry in drum vector table
+	jp	midi$drumpad$handler
+
+; ************************************************************************************
+; THE FOLLOWING ROUTINES MUST BE EXECUTED IN SRAM, BECAUSE THEY REQUIRE BANK SWITCHING
+; ************************************************************************************
+
+; The following code is moved to the sram for compatibility
+; with cp/m plus. The "Call table" serves to vector monitor calls
+; through a bank-switch, into the actual jump table which resides in
+; eprom. This way, the monitor may be called from any bank, while the
+; routines themselves remain in the eprom bank.
+
+s$code:	.phase	sram
+vectr:	CALL	BSWTCH		; 1 Monitor cold entry point
+	CALL	BSWTCH		; 2 Monitor warm entry point
+	CALL	BSWTCH		; 3 Keyboard, video, LCD and LED dispatcher
+	CALL	BSWTCH		; 4 I/O to the Sio, channels A - Console I/O
+	CALL	BSWTCH		; 5 I/O to Sio channel B - Midi I/O
+	CALL	BSWTCH		; 6 Odd system functions
+
+; Note: there must be the same number of calls here as jumps in jump table above
+
+; The read and write routines are pointed to by jumps instead of calls,
+; because they reside in sram. (they must have access to dram at the
+; current dma address)
+
+	JP	SELECT		; 7  (Select) 	SELECT DISK DRIVE <c>
+	JP	HOME		; 8  (Home)	HOME R/W HEAD
+	JP	SEEK		; 9  (Seek)	SEEK TO TRACK <c>, speed <b>
+	JP	READ		; 10 READ SECTOR
+	JP	WRITE		; 11 WRITE SECTOR
+	call	bswtch		; 12 Set disk density parameters
+	call	bswtch		; 13 Get sector address data
+	jp	setside		; 14 Set side for read/write
+	jp	swbank		; 15 Switch bank to <A>, 0-15 (ram), 0feh (eprom)
+				;    ** interrupts will be re-enabled
+
+; The static ram vector table comes through here to vector into the eprom bank.
+; Interrupts will be re-enabled!!
+
+BSWTCH:	LD	(THL),HL		;SAVE HL REGISTER FOR SWITCH
+	POP	HL
+	LD	(SPSAVE),SP
+	LD	H,0			;MAKE RELATIVE TO ADDRESS 0
+	DEC	L			;ADJUST TO ORIGINAL CALLER ADDRESS
+	DEC	L
+	DEC	L
+	LD	SP,LSTACK
+	push	ix
+	ld	(Ta),a			;SAVE CALLER ARGUMENT
+	ld	a,(bank)		;save old bank number
+	push	af
+	LD	A,beprom
+	call	swbank			;switch in the eprom bank
+	ld	a,(Ta)			;RECOVER CALLER ARGUMENT
+	PUSH	HL			;XFER HL VALUE TO IX REGISTER
+	POP	IX
+	LD	HL,(THL)		;RECOVER CALLER HL ARGUMENT
+	CALL	CALLX			;EXECUTE CALLER ROUTINE
+	LD	(Ta),A
+	pop	af			;get back original bank #
+	call	swbank
+	pop	ix
+	LD	SP,(SPSAVE)		;RECOVER ORIGINAL STACK
+	LD	A,(Ta)
+	RET				;BACK TO CALLER
+
+; Switch to bank passed in A (interrupts will be re-enabled!!)
+
+swbank:	push	bc
+	di
+	ld	(bank),a		; save bank as the current one
+	ld	b,a
+	cp	beprom			; is it the eprom bank?
+	ld	a,(config$image)	; get config. port image
+	jr	nz,notprom
+	and	not (rom$ram$switch)	; turn off rom*/ram switch (switch in eproms)
+	jr	swret
+
+; must be ram that they want selected
+
+notprom:or	rom$ram$switch		; turn on ram switch bit
+	and	0f0h			; mask out the old bank number
+	or	b			; and mask in the new bank number
+swret:	ld	(config$image),a	; update config. register image
+	out	(config),a		; send out to configuration register
+	ei
+	pop	bc
+	ret
+
+;****************************************************************
+;*								*
+;*	Fundamental Disk I/O Routines for Collosus		*
+;*               Works Only with 2797 FDC			*
+;*								*
+;****************************************************************
+
+; 2797 has Side-Select-Out pin (25) while 2793 doesn't
+; SSO --> ls240(inverter) --> drive_select (low = side 1, high = side 0)
+; SSO is controlled by the U bit in bit 1 of some commands
+
+; NOTE: the side select is now controlled by bit 5 of port b of the 8255
+; since the 2797 wasn't reading the 2nd side properly (the disk side id
+; didn't match the SSO bit?), but the SSO bit still has to match the
+; correct side because the 2797 checks this bit against the side ID from
+; the disk.
+
+; 2797 commands (2793 replaces the U bit with the C bit)
+
+rdcmd		equ	10001000B	; L = 1, side 0
+wrtcmd		equ	10101000B	; L = 1, side 0
+skcmd		equ	00011100b	;seek, load head, track verify
+rstcmd		equ	00001000b	;restore, load head, no verify
+racmd		equ	11000000b	;read sector address command, side 0
+
+; Send command to 2797
+
+CMDOUT:	OUT	(CMDreg),A	; OUTPUT COMMAND TO 2797
+
+;	 WAIT FOR 2797 TO GET HOUSE IN ORDER
+
+	LD	A,10
+STALL:	DEC	A
+	JR	NZ,STALL
+	RET
+
+; Wait until 2797 is not busy
+
+READY:
+BUSY:	IN	A,(STSreg)	; IS THE WD2797 ACTIVE ?
+	and	10000001b
+	jr	nz,busy
+	ret
+
+; Home the head
+
+HOME:	CALL	ready
+RESTOR:	ld	a,rstcmd
+	ld	hl,speed
+	or	(hl)
+	CALL	CMDOUT		; ISSUE COMMAND
+	CALL	BUSY		; WAIT UNTIL COMPLETE
+	ld	hl,trktab	; update track table entry
+	ld	a,(diskno)
+	ld	c,a
+	ld	b,0
+	add	hl,bc
+	XOR	A		; SET UP ZERO CONDITION FOR RETURN TO Z80 CALLER
+	ld	(hl),a		; clear track table entry
+	RET
+
+;  Set side selected by <c> (0 or 1)
+;  Remember to OR the (side) bit mask with type II or III commands so
+;  the SSO bit will be updated.
+
+setside:push	bc
+	ld	a,c
+	and	1		; get only 1 bit
+	inc	a
+	ld	(side),a	; create the bit mask for the U bit in the fdc
+	dec	a
+	ld	c,0
+	jr	z,setit		; go to side 0
+	ld	c,00100000b	; else side 1
+setit:	in	a,(pio$b$8255)
+	and	11011111b	; mask off side select
+	or	c
+	out	(pio$b$8255),a	; and update the side bit
+	pop	bc
+	ret
+
+; --- SELECT DRIVE ---
+;	C-reg CONTAINS DRIVE NUMBER ( 0 or 1)
+
+SELECT:	LD	A,C
+	CP	2
+	RET	NC
+	inc	a		; a = 1 or 2
+	cpl			; 11111110 or 11111101
+	ld	l,a
+	in	a,(pio$b$8255)	; get current value of port B of 8255 - motor control
+	and	11100100b	; mask off drive select and density bits
+	or	3		; de-select both drives
+	and	l		; and select the drive
+	ld	hl,density
+	OR	(hl)		;10H SINGLE DENSITY 08h FOR DOUBLE DENSITY SELECT
+	OUT	(pio$b$8255),A
+	ld	a,c		;is there a change in drive selected?
+	ld	hl,diskno
+	cp	(hl)
+	jr	z,selret	;no, skip track register update
+	ld	(hl),c
+	LD	HL,TRKTAB
+	ld	b,0
+	add	hl,bc
+	ld	a,(hl)		; get track table entry
+	cp	0FFh		; FF means drive is virgin
+	jr	z,home		;   if so, take her home
+	out	(trkreg),a	; update register for new drive
+selret:	xor	a		; clear return status
+	ret
+
+; --- Seek ---
+; enter with	<c> = track number
+;		<b> = speed
+seek:	ld	a,c
+	LD	(trackno),a
+	ld	a,b
+	ld	(speed),a
+	ld	hl,trktab	; update track table entry
+	ld	d,0
+	ld	a,(diskno)
+	ld	e,a
+	add	hl,de
+	ld	(hl),c
+	CALL	READY		; DRIVE READY ?
+	LD	A,(trackno)	; get track number
+	OUT	(DATREG),A	; ISSUE TRACK TO SEEK TO 2797
+	ld	a,skcmd
+	ld	hl,speed	; add in seek speed mask
+	or	(hl)
+	CALL	CMDOUT		; ISSUE COMMAND
+	CALL	BUSY
+	IN	A,(STSREG)	; RETURN WITH STATUS IN CASE CALLER WANTS IT
+	and	10011000b
+	ret	z		; return if all went well
+	call	home		; else try to recalibrate track position
+	LD	A,(trackno)	; get track number
+	OUT	(DATREG),A	; ISSUE TRACK TO SEEK TO 2797
+	ld	a,skcmd
+	call	cmdout
+	call	busy
+	in	a,(stsreg)
+	and	10011000b
+	RET
+
+; Send sector number to 2797
+
+SECTOR:	CALL	busy
+	LD	HL,SECTNO
+WSEC:	LD	A,(HL)		; GET DESIRED SECTOR
+	OUT	(SECREG),A	; SET 2797 SECTOR REGISTER
+	IN	A,(SECREG)
+	CP	(HL)
+	JR	NZ,WSEC
+	RET
+
+; prepare for read/write
+
+rwprep:				; <hl> = dma, <c> = sector
+	LD	(DMADR),HL	; ARRIVE HERE FOR READ UNDER Z80 CONTROL
+				;  PASS DMA ADDRESS FROM HL TO REAL READ FOLLOWING
+	LD	A,C
+	LD	(SECTNO),A	;  LIKEWISE SECTOR NUMBER PASSED IN C
+	ret
+
+; Read a sector
+
+READ:	call	rwprep		; set up dma address and sector number
+	XOR	A
+	LD	(RETRYNO),A	; AND THE COUNT OF RETRIES
+DREAD:	CALL	SECTOR		; SET UP DESIRED SECTOR
+	LD	bc,(SECSZ)	; GET CURRENT SECTOR SIZE
+	CALL	busy		; CHECK READY
+	ld	a,rdcmd
+	ld	hl,side
+	or	(hl)		; mask in the U bit (side)
+	ld 	hl,(dmadr)	; get dma address
+read2:	call	getdata		; go input the sector
+	CALL	BUSY		; WAIT FOR END OF PROCESS
+RSTAT:	IN	A,(STSREG)	; CHECK STATUS OF COMMAND EXECUTION
+	and	11011100b
+	ld	(errorst),a
+	ret	z		; return if all went well
+	LD	HL,RETRYNO
+	LD	A,(HL)
+	INC	A
+	LD	(HL),A		; INCREMENT RETRY COUNT
+	CP	6		; 6 RETRIES YET ?
+	JR	Z,RDERR		; GO TO RECOVERY ROUTINE
+	JR	DREAD		; TRY TO READ SECTOR AGAIN
+RDERR:	LD	A,(ERRORst)
+	OR	A		; return with <a> = ststus
+	RET
+
+;	THIS IS THE SECTOR WRITE ROUTINE
+
+WRITE:	call	rwprep
+	XOR	A
+	LD	(RETRYNO),A	; AND THE COUNT OF RETRIES
+DWRITE:	CALL	SECTOR
+	LD	bc,(SECSZ)	; CURRENT SECTOR SIZE
+	CALL	busy		; CHECK READY
+	ld	a,wrtcmd
+	ld	hl,side
+	or	(hl)		; mask in the U bit (side select)
+	ld 	hl,(dmadr)	; get dma address
+write2:	CALL 	CMDOUT		; ISSUE WRITE COMMAND
+write3:	in	a,(stsreg)	; get 2797 status
+	and	2
+	jr	z,write3	; wait for data request (DRQ)
+	ld	a,(hl)		; pick up byte of sector
+	out	(datreg),a	; send out the data
+	inc	hl
+	dec	bc		; dec number of byte to read in
+	ld	a,b
+	or	c
+	jr	nz,write3	; go read in the entire sector
+	CALL	BUSY		; WAIT FOR END OF PROCESS
+WSTAT:	IN	A,(STSREG)
+	AND	11011100B	; CHECK TO SEE IF EVERYTHING WENT OKAY
+	LD	(ERRORst),A
+	ret	z		; return if no error
+WTRTRY:	LD	HL,RETRYNO	; else retry
+	LD	A,(HL)
+	INC	A
+	LD	(HL),A		; UPDATE RETRY COUNT
+	CP	6		; TEN RETRIES YET ?
+	jr	nz,dwrite	; no, so try again
+WTERR:	LD	A,(errorst)
+	OR	A		; GUARANTEE NONZERO RETURN CONDITION FOR Z80 CALLER
+	RET
+
+; ENTER HERE FROM MONITOR "BOOT" COMMAND TO LOAD CP/M
+
+BOOT:	LD	A,(PARAM1)	; USE BANK 0 FOR CPM3 BOOT
+	CALL	SWBANK		; TO READ FROM DISK INTO DRAM
+	ld	a,(param2)	; select boot device
+	LD	C,a
+	call	SELECT
+	JR	NZ,DSKER
+	ld	c,0
+	call	setside		; side 0
+	ld	c,0		; track 0
+	ld	b,1		; speed 1
+	call	seek
+	jr	nz,dsker
+	LD	HL,0080H	;POINT TO CP/M READ BUFFER
+	LD	C,1		;SELECT SECTOR 1
+	CALL	READ		;READ TRACK 0/ SECTOR 1
+	JR	NZ,DSKER
+	POP	AF		;CLEAN UP STACK
+	JP	0080H		;GO EXECUTE LOADER
+
+DSKER:	ld	c,a
+	LD	A,beprom
+	CALL	SWBANK		; back to eprom bank to report errors
+	ld	a,c
+	or	a
+	JP	DSKERR
+
+; Wait for, and pick up (BC) bytes of data from 2797 and store in (HL)
+; Enter with <A> = command to send to 2797
+
+getdata:call	cmdout		; issue the command
+getd2:  in	a,(stsreg)	; get 2797 status
+	and	2
+	jr	z,getd2		; wait for data request (DRQ)
+	in	a,(datreg)	; pick up the data
+	ld	(hl),a		; and store it away
+	inc	hl
+	dec	bc		; dec number of byte to read in
+	ld	a,b
+	or	c
+	jr	nz,getd2	; go read in the entire sector
+	ret
+
+veclen	equ	$-vectr		; compute length of block to move
+	.dephase
+
+; %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+; The above code must end before the monitor area work variables and buffers
+; %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+;	-- DISK SECTOR READ COMMAND --
+;
+
+DSKCMD:	CP	3		;CHECK PARAMETER COUNT
+	SCF
+	RET	NZ
+	ld	a,(param1)	;USE FIRST ARG AS UNIT#
+	ld	c,a
+	CALL	SELECT
+	JR	NZ,DSKERR
+	ld	a,(param2)
+	LD	c,a		;USE SECOND ARG AS TRACK#
+	ld	b,1		;seek speed
+	CALL	SEEK
+	JR	NZ,DSKERR
+	ld	a,(param3)
+	LD	c,a		;USE THIRD ARG AS SECTOR#
+	LD	HL,(DMADR)	;USE DEFAULT DMA BUFFER
+	CALL	READ
+	JR	NZ,DSKERR
+	ld	de,(secsz)	; get sector size (number of bytes)
+	srl	d
+	rr	e		; / 2
+	srl	d
+	rr	e		; / 4
+	srl	d
+	rr	e		; / 8
+	srl	d
+	rr	e		; / 16   <de> = # of 16 byte lines to dump
+	LD	HL,(DMADR)	; CHANGED  FROM DBUF TO DMADR
+	JP	DUMP		;DUMP DISK READ BUFFER AND RETURN
+
+
+DSKERR:	push	af		; save 2797 status
+	call	print$string
+	DEFM	'DISK ERROR '
+	DEFB	EOT
+	pop	af
+	ld	c,a
+	LD	B,8		;PRINT 2797 ERROR BYTE IN BINARY
+DSKR2:	XOR	A
+	RL	C
+	ADC	A,'0'		;TRANSFORM A INTO ASCII '1' OR '0'
+	push	bc
+	CALL	OUTPUT
+	pop	bc
+	DJNZ	DSKR2		;REPEAT FOR 8 BITS
+	OR	A
+	RET
+
+;		--WRITE TO DISK ROUTINE--
+
+DSKWRT:	CP	3		;CHECK PARAMETER COUNT
+	SCF
+	RET	NZ
+	LD	C,L		;USE FIRST ARG AS UNIT#
+	CALL	SELECT
+	JR	NZ,DSKERR
+	LD	HL,PARAM2
+	LD	C,(HL)		;USE SECOND ARG AS TRACK#
+	ld	b,1		;seek speed
+	CALL	SEEK
+	JR	NZ,DSKERR
+	ld	a,(param3)
+	LD	c,a		;USE THIRD ARG AS SECTOR#
+	LD	HL,(DMADR)	;USE DEFAULT DMA BUFFER
+	CALL	WRITE
+	JR	NZ,DSKERR
+	LD	HL,(DMADR)	;LOAD START ADDRESS FOR DUMP
+	ld	de,(secsz)	; get sector size (number of bytes)
+	srl	d
+	rr	e		; / 2
+	srl	d
+	rr	e		; / 4
+	srl	d
+	rr	e		; / 8
+	srl	d
+	rr	e		; / 16   <de> = # of 16 byte lines to dump
+	JP	DUMP		;DUMP WRITE BUFFER AND RETURN
+
+;	-- DISKX SELECT 8 OR 5 INCH  FLOPPY, SIDE 1  OR 2 AND S D DENSIIY--
+
+DISKX:	CP	3		;CHECK IF PARAMETER COUNT=3
+	SCF
+	RET	NZ
+DISKX1:	ld	a,(param2)	; get side (0 or 1)
+	ld	(side),a
+	ld	a,(param3)	; get density (1 or 2)
+	ld	e,a
+	ld	hl,(secsz)	; get sector size (bytes)
+	call	setdens
+	ld	a,(side)
+	ld	c,a
+	call	setside
+	RET
+
+; Jump table routine for setting disk density parameters.
+; Enter with	<hl> = sector size (bytes)
+;		<e> = 1 for single density, 2 for double density
+
+setdens:
+	ld	(secsz),hl		; save sector size
+	ld	a,e
+	cp	2
+	ld	a,08h			; double density with precomp (enp=1, dden*=0)
+	jr	z,set2
+	ld	a,10h			; single density without precomp (enp=0, dden*=1)
+set2:	ld	(density),a
+	ret
+
+;		DMA READ WRITE ADDRESS
+
+DISKY:	CP	1
+	SCF
+	RET	NZ
+	LD	(DMADR),HL
+	OR	A
+	RET
+;
+
+DISKZ:	CP	1
+	SCF
+	RET	NZ
+	LD	(SECSZ),HL
+	OR	A
+	RET
+
+;  GETSAD - return info from the sector address header on disk
+;
+;  Return with	<d> = track address
+;		<e> = side number
+;		<b> = sector address
+;		<c> = sector size code (00 = 128, 01 = 256, 02 = 512, 03 = 1024)
+
+getsad:	xor	a
+	ld	(retryno),a	; Zero retry counter
+gets2:	call	ready		; CHECK READY
+	LD	A,racmd		; read sector address command
+	ld	hl,side
+	or	(hl)		; mask in the U bit (side select)
+	ld	hl,dbuf		; point to buffer
+	ld	bc,6		; read 6 bytes - the sector address block
+	call	getdata		; get block of data from 2797
+	CALL	BUSY		; WAIT FOR END OF PROCESS
+	in	a,(stsreg)	; get status
+	and	11011100b	; mask for read relevant bits
+	ld	(errorst),a
+	jr	z,gets3		; continue if no error
+	ld	hl,retryno	; else retry up to 2 times
+	inc	(hl)
+	ld	a,(hl)
+	cp	2
+	jr	nz,gets2
+
+gets3:	ld	hl,dbuf		; get header data from sector buffer
+	ld	d,(hl)		; get track address
+	inc	hl
+	ld	e,(hl)		; get side number
+	inc	hl
+	ld	b,(hl)		; get sector address
+	inc	hl
+	ld	c,(hl)		; sector size (00,01,02,03 = 128,256,512,1024)
+	ld	a,(errorst)
+	ret
+
+if ((sram + veclen + 1) GT (midi$input$buffer))
+	.printx "Static ram routines overflowing into Midi Input Buffer"
+endif
+
+; this macro evaluates a label to print out in decimal
+
+showval: macro	?xx
+	.printx ?xx
+	endm
+
+vec	equ	end$of$variables
+	.printx Monitor work area variables should be less than 65280:
+	showval %vec
+vec1	equ	(sram + veclen)
+	.printx Disk I/O routines should be less than 64512:
+	showval %vec1
+	end
+
+; ------------------------------ Thats All !! ----------------------------------
+
+

@@ -1,0 +1,379 @@
+.comment\
+**************************************************************
+*
+*  The game of "Simon" to be used with the related hardware.
+*
+*    By RCL9
+*	(Rob's Retro Computing Archive)
+*	RetroComputingArchive@gmail.com
+*	https://github.com/rcl9
+*
+**************************************************************\
+
+; NOTE:: this program places the note array at F000H so it
+; may destroy part of the system in later versions!
+
+public	play$simon
+
+extrn	speak		; votrax speak entry point
+
+extrn	rst$rs232$driver
+extrn	rst$io$driver
+
+extrn	pmsg
+extrn	dec$out
+extrn	pio$a$8255
+extrn	pio$c$8255
+extrn	mem$bot
+extrn	print$string
+extrn	linbuf
+extrn	inp$dec
+extrn	asc$dec
+extrn	crlf
+extrn	kbdin
+extrn	led$clear
+extrn	dis$asc
+extrn	crtout
+extrn	put2hs
+
+extrn	cr
+extrn	lf
+extrn	eot
+
+; =-=-=-=-=-=-=-=-=- Play Game Of Simon =-=-=-=-=-=-=-=-=-
+
+; Plays game of simon usinfg external hardware attached to
+; Universal parallel port.
+
+play$simon:
+
+	call	print$string
+	defb	cr,lf,lf,'Welcome to Simon.',cr,lf, eot
+	call	print$string
+	defb	'Attach to parallel port. Press any key',eot
+
+;	call	speak
+; 	defm	'WELCOME TO SYMON',eot
+
+	call	kbdin
+;	ld	c,2
+;	call	rst$rs232$driver ; wait for a keypress from keyboard or rs-232
+
+	call	print$string
+	defb	cr,lf,'The LED''s will show # of correct notes',eot
+
+try$agn:call	crlf
+;	ld	hl,simsg2
+;	call	pmsg
+;	call	speak
+	call	print$string
+simsg2:	defm	'How many notes to try for? ',eot
+
+	ld	hl,linbuf
+	call	inp$dec		; input decimal string
+	ld	hl,linbuf
+	call	asc$dec
+	jr	c,try$agn
+	or	a		; CR just pressed?
+	jr	z,try$agn
+
+no$err:	call	crlf
+	ld	b,e		; only keep lower byte
+
+; get random notes
+
+sstart:	ld	d,b		; create d random notes
+	ld	c,0
+	ld	hl,mem$bot      ; put table at 0f000h
+
+get$ran:defb	0edh,05fh	; 'ld	a,r' -  get random value from refresh register
+
+; Aug 21 2026. RCL, commented out - why do this?
+;	srl	a
+
+	and	3		; need 0-3
+	cp	c		; check to see if next note the same
+	jr	z,get$ran	; get a new random number
+
+	ld	c,a		; keep for next pass
+
+	ld	e,1		; now compute 2^a
+	cp	0
+	jr	z,store
+	ld	e,2
+	cp	1
+	jr	z,store
+	ld	e,4
+	cp	2
+	jr	z,store
+	ld	e,8
+
+store:	ld	a,255
+	sub	e		; 255-2^a
+	and	0fh
+	ld	(hl),a		; store in table
+
+.comment\
+	; List the number to the RS-232/LCD display
+	push	hl
+	ld	h,0
+	ld	l,a
+	push	bc
+	call	put2hs:
+	ld	a,' '
+	call	crtout
+	pop	bc
+	pop	hl
+\
+
+	inc	hl
+	dec	d		; dec. number of notes to make
+	jr	nz,get$ran	; go make more
+
+	call	crlf
+
+; start note output
+	call	led$clear
+
+	ld	c,0		; start with 1 note correct
+
+next$note:
+	inc	c		; another note right
+
+	; Display register C on successive LEDs for status update
+	ld	a, c
+	push	bc
+	push	de
+	ld	e, c
+	dec	e		; 0-based LED number
+	call	dis$asc
+	pop	de
+	pop	bc
+
+	ld	e,0
+	ld	hl,mem$bot     	; point to start of note table
+
+; Send out the series of notes for the user to try against
+
+send$nt:ld	a,(hl)
+	inc	hl
+	out	(pio$a$8255),a	; start note's oscillator circuit
+	call	tone$wait	; wait a bit
+	ld	a,255
+	out	(pio$a$8255),a	; turn off note
+	inc	e		; Current note number
+	ld	a,c		; Number of notes in the table
+	cp	e		; Have we output all the notes yet in the sequence?
+	jr	nz,send$nt	; No, send next note in sequence
+
+	ld	e,0
+	ld	hl,mem$bot
+
+wait$1:	ld	a,c		; Number of notes in the table
+.comment\
+	push	de
+	push	bc
+	ld	c,10h		; display # of correct on leds
+	ld	d,0
+	dec	a
+	ld	e,a
+	call	rst$io$driver
+	pop	bc
+	pop	de
+\
+
+wait$11:in	a,(pio$c$8255)	; wait for button to be pressed
+	and	0fh
+	cp	0fh
+	jr	z,wait$11
+	call	wait$2msec	; wait for key debounce
+	call	wait$2msec
+
+	; RCL, added more for key debounce, Aug 21 2026
+	call	wait$2msec
+	call	wait$2msec
+	call	wait$2msec
+
+	in	a,(pio$c$8255)
+	and	0fh
+	push	af		; save pressed button
+got2:	in	a,(pio$c$8255)	; wait till person releases the button
+	and	0fh
+	cp	0fh
+	jr	nz,got2
+	pop	af		; get back pressed button
+	cp	(hl)		; same note?
+	jr	nz,missed	; person pressed wrong key
+got$it:	inc	e
+	inc	hl
+
+	ld	a,c
+	push	bc
+	inc	b
+	cp	b
+	pop	bc
+	jr	nz,wait$2
+	call	print$string
+	defb	cr,lf,'You got all ',eot
+	ld	h,0
+	ld	l,b
+	push	bc
+	call	dec$out
+	pop	bc
+	call	print$string
+	defb	' tones correct.',cr,lf,eot
+;	call	speak
+;	defm	'VARY GOOD, TRY AGAIN',eot
+	jp	do$tune
+
+wait$2:	in	a,(pio$c$8255)
+	and	0fh
+	cp	0fh
+	jr	nz,wait$2
+	ld	a,e
+	cp	c
+	jp	nz,wait$1
+
+; retry delay
+
+retry:	call	tone$wait
+	call	tone$wait
+	jp	next$note
+
+; person pressed wrong key
+
+missed:	push	bc		; C = number of correct notes
+	push	hl		; Address of the current note #
+
+	call	print$string
+	defb	cr,lf,'Fail. Button=',eot
+	ld	h,0
+	ld	l,a
+	call	put2hs		; Print out the incorrect note just pressed
+	call	print$string
+	defb	'. Correct=',eot
+
+	; Print out the expected note
+	pop	hl
+	ld	a, (hl)
+	ld	h,0
+	ld	l,a
+	call	put2hs
+
+	; Print out the # of correct notes entered
+	call	print$string
+	defb	'.# Ok =', eot
+
+	pop	bc
+	ld	h,0
+	ld	l,c
+	call	dec$out
+
+	call	print$string
+;	defb	cr,lf,eot
+
+	call	print$string
+	defb	'. Try again at the tone.',eot
+
+	call	wait$2sec
+
+;	call	speak
+;	defm	'SORRY, YOU MISSED THAT ONE',eot
+
+.comment\
+
+	ld	d,2
+sloop3:	ld	e,2
+sloop1:	ld	a,251
+	out	(pio$a$8255),a
+	call	tone$2$wait
+	ld	a,254
+	out	(pio$a$8255),a
+	call	tone$2$wait
+	dec	e
+	jr	nz,sloop1
+	ld	e,2
+
+sloop2:	ld	a,247
+	out	(pio$a$8255),a
+	call	tone$2$wait
+	ld	a,253
+	out	(pio$a$8255),a
+	call	tone$2$wait
+	dec	e
+	jr	nz,sloop2
+	dec	d
+	jr	nz,sloop3
+	ld	a,255
+	out	(pio$a$8255),a
+	call	wait$2sec
+\
+	jp	sstart		; restart program
+
+do$tune:
+	ld	d,7
+sloop4:	ld	a,254
+	out	(pio$a$8255),a
+	call	tone$2$wait
+	ld	a,253
+	out	(pio$a$8255),a
+	call	tone$2$wait
+	ld	a,251
+	out	(pio$a$8255),a
+	call	tone$2$wait
+	ld	a,247
+	out	(pio$a$8255),a
+	call	tone$2$wait
+	ld	a,255
+	out	(pio$a$8255),a
+
+	dec	d
+	jr	nz,sloop4
+	call	wait$2sec
+	jp	sstart		; restart program
+
+; wait 2 seconds
+
+wait$2sec:
+	call	tone$wait
+	call	tone$wait
+	call	tone$wait
+	call	tone$wait
+	ret
+
+; wait 527 ms
+
+tone$wait:
+	push	bc
+	ld	b,251
+wait$3:	call	wait$2msec
+	djnz	wait$3
+	pop	bc
+	ret
+
+; wait 170 ms
+
+tone$2$wait:
+
+	push	bc
+	ld	b,81
+wait$4:	call	wait$2msec
+	djnz	wait$4
+	pop	bc
+	ret
+
+wait$2msec:	; wait 2.1 msec
+
+	push	af
+	push	hl
+	ld	hl,323
+dec:	dec	hl		; 6   loop takes 6.5 usec
+	ld	a,h		; 4
+	or	l		; 4
+	jr	nz,dec		; 12
+	pop	hl
+	pop	af
+	ret
+
+	end
+

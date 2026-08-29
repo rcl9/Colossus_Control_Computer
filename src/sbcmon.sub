@@ -1,0 +1,15 @@
+; Compile the source
+z80asm sbcmon
+z80asm lcd
+z80asm simon
+m80 =xmodem
+z80asm keytbls
+z80asm speak
+
+; Link
+l80 /p:0,sbcmon,lcd,simon,xmodem,keytbls,speak,sbcmon/n/e
+
+; Write the final ROM image back to Windows via the Yaze emulator
+a:w tmp/sbcmon25.com b
+
+

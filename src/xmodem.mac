@@ -1,0 +1,769 @@
+.comment\
+
+                  October 11, 1985
+--------------------------------------------------------
+
+Xmodem send/recieve routines for Colossus computer and
+RS-232 port A.
+
+Integrated by RCL9
+	(Rob's Retro Computing Archive)
+	RetroComputingArchive@gmail.com
+	https://github.com/rcl9
+
+Input:	A = 0 : send from memory to RS-232
+	A = 1 : receive from RS-232 to memory
+	BC = transfer length-1
+	DE = return address (stack is possibly wrecked)
+	HL = transfer start address
+
+Invoke: JP XMODEM
+
+NOTE:	All screen I/O has been commented out (.comment),
+	so when LCD is put in , take out the comments
+	and route the I/O to the LCD, not the RS-232.
+
+--------------------------------------------------------\
+
+public	xmodem
+
+extrn	print$string
+extrn	clear$rs232$buffers
+extrn	crtout
+extrn	kbdst
+extrn	kbdin
+extrn	kbdin2
+
+NO	EQU	0
+YES	EQU	0FFH
+
+; Define ASCII characters used
+
+ACK	EQU	06H	;acknowledge
+BELL	EQU	7	;bell
+CAN	EQU	18H	;CTL-X for cancel
+CR	EQU	0DH	;carriage return
+CRC	EQU	'C'	;CRC request character
+EOF	EQU	1AH	;^Z for end of file
+EOT	EQU	04H	;end of transmission
+LF	EQU	0AH	;linefeed
+NAK	EQU	15H	;negative acknowledge
+SOH	EQU	01H	;start of header
+
+;=======================================================================
+
+; The receiving station sends an 'ACK' for each valid sector 
+; received. It sends a 'NAK' for each sector incorrectly 
+; received.  In poor conditions either may be garbled.  
+; Waiting for a valid 'NAK' can slow things down somewhat, 
+; giving more time for the interference to quit.
+;
+ACKNAK 	EQU	NO	;yes resends a record after any non-ACK
+			;no requires a valid NAK to resend a record
+
+; ---------------------------------------------------------
+
+xmodem:	
+
+	.z80	
+	ld	(recptr),hl
+	ld	(length),bc
+	ld	(retaddr),de
+
+	push	af
+	ld	hl,0
+	ld	a,0
+	ld	(CRCVAL),hl		;current CRC value
+	ld	(FRSTIM),a		;turned on after first 'SOH' received
+	ld	(RCVRNO),a		;record number received
+	ld	(RECDNO),a		;current record number
+	pop	af
+
+	.8080
+
+	cpi	0
+	jz	sendmem
+	mvi	a,'R'
+	sta	optsav
+	mvi	a,0		; enable CRC option
+	sta	crcflg
+	CALL	print$string
+	db	'Ready to receive data.',cr,lf
+	db	'(CRC is enabled)',cr,lf,eot
+	call	clear$rs232$buffers
+	jmp	rcvfil
+
+sendmem:mvi	a,'S'
+	sta	optsav
+	CALL	print$string
+	db	'Ready to send.',cr,lf,eot
+	call	clear$rs232$buffers
+	mvi	e,100
+	call	waitnak
+	jmp	sndlp2
+
+;* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+;
+; ---> SENDFIL	sends a file
+;
+;* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+SENDFIL:MVI	E,100		;wait 100 sec for initial 'NAK'
+	CALL	WAITNAK
+;
+SENDLP:	CALL	RDRECD		;read a record
+	JC	SENDEOF 	;send 'EOF' if done
+SNDLP2:	CALL	INCRRNO 	;bump record number
+	XRA	A		;initialize error count to zero
+	STA	ERRCT
+;
+SENDRPT:CALL	SENDHDR 	;send a header
+	CALL	SENDREC 	;send data record
+	LDA	CRCFLG		;get 'CRC' flag
+	ORA	A		;'CRC' in effect?
+	CZ	SENDCRC 	;yes, send 'CRC'
+	CNZ	SENDCKS 	;no, send checksum
+	CALL	GETACK		;get the 'ACK'
+	JC	SENDRPT 	;repeat if no 'ACK'
+	LDA	OPTSAV		;get the command option again
+;
+SNRPT1:	JMP	SENDLP		;loop until EOF
+;
+; File sent, send EOT's
+;
+SENDEOF:MVI     A,EOT           ;send an 'EOT'
+	CALL	SEND
+	CALL	GETACK		;get the ACK
+	JC	SENDEOF 	;loop if no ACK
+	.z80
+exit:	ld	hl,(retaddr)
+	jp	(hl)
+	.8080
+;
+;* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+;
+; ---> RCVFIL	Receive a CP/M file
+;
+;* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+RCVFIL:	
+RCVLP:	CALL	RCVRECD 	;get a record
+	JC	RCVEOT		;got 'EOT'
+	CALL	WRRECD		;write the record
+	CALL	INCRRNO 	;bump record number
+	CALL	SENDACK 	;ack the record
+	JMP	RCVLP		;loop until 'EOF'
+;
+; Got EOT on record so flush buffers then done
+;
+RCVEOT: LDA	RECDNO		;check for zero length record
+	CPI	0
+	JNZ	EOT1		;at least some upload
+	LDA	RECDNO+1	;check second byte
+	CPI	0
+	JNZ	EOT1
+	CALL	RCVSABT		;abort and erase the zero length file
+	JMP	EXIT		;and exit
+EOT1:	CALL	SENDACK 	;ack the record
+	JMP	EXIT
+
+;* * * * * * * * * * * * * * * * * * * * * * * * * * * *
+;
+;			SUBROUTINES
+;
+;* * * * * * * * * * * * * * * * * * * * * * * * * * * *
+;
+; ---> RCVRECD	Receive a record
+;
+; Returns with carry bit set if EOT received
+;
+RCVRECD:XRA	A		;initialize error count to zero
+	STA	ERRCT
+;
+RCVRPT:	XRA	A		;get 0
+	STA	ERRCDE		;clear receive error code
+	MVI	B,10-1		;10-second timeout
+	CALL	RECV		;get any character received
+	JC	RCVSTOT 	;timeout
+	CPI	SOH		;hoping for a 'SOH'
+	JZ	RCVSOH		;yes
+	ORA	A
+	JZ	RCVRPT		;ignore nulls
+	CPI	CRC		;ignore our own 'CRC' if needed
+	JZ	RCVRPT
+	CPI	NAK		;ignore our own 'NAK' if needed
+	JZ	RCVRPT
+	CPI	EOT		;end of transfer?
+	STC			;return with carry set if 'EOT'
+	RZ
+;
+;
+; Didn't get SOH or EOT - or - didn't get valid header - purge the line,
+; then send nak
+;
+RCVSERR:MVI	B,1		;wait for 1 second
+	CALL	RECV		;after last char. received
+	JNC	RCVSERR 	;loop until sender done
+	LDA	CRCFLG		;get 'CRC' flag
+	ORA	A		;'CRC' in effect?
+	MVI	A,NAK		;put 'NAK' in accum
+	JNZ	RCVSER2 	;no, send the 'NAK'
+	LDA	FRSTIM		;get first time switch
+	ORA	A		;has first 'SOH' been received?
+	MVI	A,NAK
+	JNZ	RCVSER2 	;yes, then send 'NAK'
+	MVI	A,CRC		;tell sender 'CRC' is in effect
+;
+RCVSER2:CALL	SEND		;   the 'NAK' or 'CRC' request
+	LDA	ERRCT		;abort if
+	INR	A		;   we have reached
+	STA	ERRCT		;the error
+	CPI	10		;   limit?
+	JC	RCVRPT		;   no, try again
+;
+;
+; Error limit exceeded, so abort
+;
+RCVSABT:
+
+.comment\
+
+	CALL	print$string
+	DB	CR,LF,CR,LF,'++ RECEIVED FILE CANCELLED ++',eot
+\
+	jmp	exit
+
+;
+; Timed out on receive
+;
+RCVSTOT:JMP	RCVSERR 	;bump error count, etc.
+;
+;
+; Got SOH - get block number, block number complemented
+;
+RCVSOH:	MVI	B,1		;timeout = 1 sec
+	STA	FRSTIM		;indicate first 'SOH' received
+	CALL	RECV		;get record
+	JC	RCVSTOT 	;got timeout
+	MOV	D,A		;D=block number
+	MVI	B,1		;timeout = 1 sec
+	CALL	RECV		;get complimented record number
+	JC	RCVSTOT 	;timeout
+	CMA			;calculate the	complement
+	CMP	D		;good record number?
+	JZ	RCVDATA 	;yes, get data
+;
+;
+; Got bad record number
+;
+	JMP	RCVSERR 	;bump error count
+;...
+;
+;
+RCVDATA:MOV	A,D		;get record number
+	STA	RCVRNO		;save it
+	MVI	C,0		;initialize checksum
+	CALL	CLRCRC		;clear CRC counter
+	MVI	D,128		;initialize the count
+	LHLD	RECPTR		;get buffer address
+;
+RCVCHR:	MVI	B,1		;1 sec timeout
+	CALL	RECV		;get the character
+	JC	RCVSTOT 	;timeout
+	MOV	M,A		;store the character
+	INX	H		;point to next character
+	DCR	D		;done?
+	JNZ	RCVCHR		;no, loop if <= 128
+	LDA	CRCFLG		;get 'CRC' flag
+	ORA	A		;'CRC' in effect?
+	JZ	RCVCRC		;yes, to receive 'CRC'
+;
+;
+; Verify checksum
+;
+	MOV	D,C		;save checksum
+	MVI	B,1		;timeout length
+	CALL	RECV		;get checksum
+	JC	RCVSTOT 	;timeout
+	CMP	D		;checksum ok?
+	JNZ	RCVSERR 	;no, error
+;
+;
+; Got a record, it's a duplicate if = previous, or OK if = 1 + previous
+; record
+;
+CHKSNUM:LDA	RCVRNO		;get received
+	MOV	B,A		;save it
+	LDA	RECDNO		;get previous
+	CMP	B		;prev repeated?
+        JZ      RECVACK         ;'ACK' to catch up
+	INR	A		;calculate next record number
+	CMP	B		;match?
+	JNZ	ABORT		;no match - stop sender, exit
+	RET			;carry off - no errors
+;
+; ---> RCVCRC	Receive the Cyclic Redundancy Check characters (2 bytes)
+;		and see if the CRC received matches the one calculated.
+;		If they match, get next record, else send a NAK request-
+;		ing the record be sent again.
+;
+RCVCRC:	MVI	E,2		;number of bytes to receive
+;
+RCVCRC2:MVI	B,1		;1 sececond timeout
+	CALL	RECV		;get crc byte
+	JC	RCVSTOT 	;timeout
+	DCR	E		;decrement the number of bytes
+	JNZ	RCVCRC2 	;get both bytes
+	CALL	CHKCRC		;check received CRC against calc'd CRC
+	ORA	A		;is CRC okay?
+	JZ	CHKSNUM 	;yes, go check record numbers
+	JMP	RCVSERR 	;go check error limit and send NAK
+;
+;
+; Previous record repeated, due to the last ACK being garbaged.  ACK it
+; so sender will catch up
+;
+RECVACK:CALL	SENDACK 	;send the ACK
+	JMP	RCVRECD 	;get next block
+;.....
+;
+;
+; Send an ACK for the record
+;
+SENDACK:MVI     A,ACK           ;get 'ACK'
+	CALL	SEND		;  and send it
+	RET
+;.....
+;
+;
+; ---> SENDHDR	Send the record header
+;
+; Send	(SOH) (block number) (complemented block number)
+;
+SENDHDR:MVI	A,SOH		;send
+	CALL	SEND		;  'SOH',
+	LDA	RECDNO		;then send
+	CALL	SEND		;  record number
+	LDA	RECDNO		;then record number
+	CMA			;  complemented
+	CALL	SEND		;  record number
+	RET			;from SENDHDR
+;.....
+;
+;
+; ---> SENDREC	send the data record
+;
+SENDREC:MVI	C,0		;initialize checksum
+	CALL	CLRCRC		;clear the 'CRC' counter
+	MVI	D,128		;initialize the count
+	LHLD	RECPTR		;get buffer address
+;
+SENDC:	MOV	A,M		;get a character
+	CALL	SEND		;send it
+	INX	H		;point to next character
+	DCR	D		;done?
+	JNZ	SENDC		;loop if <=128
+	RET			;from SENDREC
+;.....
+;
+;
+; ---> SENDCKS	send the checksum
+;
+SENDCKS:MOV	A,C		;send the
+	CALL	SEND		;  checksum
+	RET			;from 'SENDCKS'
+;.....
+;
+;
+; ---> SENDCRC	Send the two Cyclic Redundancy Check characters.  Call
+;		FINCRC to calculate the CRC which will be in 'DE' upon
+;		return.
+;
+SENDCRC:CALL	FINCRC		;calculate the 'CRC' for this record
+	MOV	A,D		;put first 'CRC' byte in accumulator
+	CALL	SEND		;send it
+	MOV	A,E		;put second 'CRC' byte in accumulator
+	CALL	SEND		;send it
+	XRA	A		;set zero return code
+	RET
+;.....
+;
+;
+; ---> GETACK  Get the ACK on the record
+;
+; Returns with carry clear if ACK received.  If an ACK is not received,
+; the error count is incremented, and if less than 10, carry is set and
+; the record is resent.  if the error count is 10, the program aborts.
+; waits 12 seconds to avoid any collision with the receiving station.
+;
+GETACK:	MVI	B,12		;wait 12 seconds max
+	CALL	RECVDG		;receive with garbage collect
+	JC	ACKERR		;timed out
+	CPI	ACK		;was it an 'ACK' character?
+	RZ			;yes, return
+;
+	 IF	NOT ACKNAK
+	CPI	NAK		;was it an authentic 'NAK'?
+	JNZ	GETACK		;ignore if neither 'ACK' nor 'NAK'
+	 ENDIF			;NOT ACKNAK
+;
+;
+; Timeout or error on ACK - bump error count then resend the record if
+; error limit is not exceeded
+;
+ACKERR:	LDA	ERRCT		;get count
+	INR	A		;bump it
+	STA	ERRCT		;save back
+	CPI	10		;at limit?
+	RC			;if not, go resend the record
+;
+;
+; Reached error limit
+;
+CSABORT:
+
+.comment\
+
+	CALL	ERXIT
+	DB	'++ SEND FILE CANCELLED ++' ,eot
+\
+	jmp	exit	
+
+ABORT:	
+;
+ABORTL:	MVI	B,1		;one second without characters
+	CALL	RECV
+	JNC	ABORTL		;loop until sender done
+	MVI	A,CAN		;CTL-X
+	CALL	SEND		;stop sending end
+;
+ABORTW:	MVI	B,1		;one second without chracters
+	CALL	RECV
+	JNC	ABORTW		;loop until sender done
+	MVI	A,CR		;get a space...
+	CALL	SEND		;to clear out CTL-X
+
+.comment\
+	CALL	ERXIT		;exit with abort message
+	DB	'++ XMODEM ABORTED ++',eot
+\
+	jmp	exit
+
+;
+; ---> INCRRNO	increment record number
+;
+INCRRNO:PUSH	H
+	LHLD	RECDNO		;increment record number
+	INX	H
+	SHLD	RECDNO
+
+
+.comment\	; *** start of comment block
+
+
+	 IF	NOT USECON	;save the check if guaranteed conout
+	LHLD	CONOUT+1	;check to see if showing count on crt
+	MOV	A,H		;if both zero, user did not fill out
+	ORA	L		;   'CONOUT:  jmp 0000H' in patch area
+	JZ	INCRN5		;   with his own console output address
+	 ENDIF			;NOT USECON
+;
+;
+; Display the record count on the local CRT if "CONOUT" was filled in by
+; the implementor
+
+	MVI	A,1
+	STA	CONONL		;set local only
+	LDA	OPTSAV		;see if receive or send mode
+	CPI	'R'
+	JZ	RMSG
+	CALL	print$string
+	DB	CR,'Sent # ',eot
+	JMP	REST
+RMSG:	CALL	print$string
+	DB	CR,'Received # ',eot
+REST:	LHLD	RECDNO
+	CALL	DECOUT
+	CALL	print$string
+	DB	' ',eot
+;
+	XRA	A		;reset the flag for local only
+	STA	CONONL
+
+\		; *** End of comment block
+
+INCRN5:	POP	H		;here from above if no CONOUT
+	RET
+
+.comment\
+
+
+; ---> DECOUT  Decimal output routine - call with decimal value in 'HL'
+
+DECOUT:	PUSH	B
+	PUSH	D
+	PUSH	H
+	LXI	B,-10
+	LXI	D,-1
+;
+DECOU2:	DAD	B
+	INX	D
+	JC	DECOU2
+	LXI	B,10
+	DAD	B
+	XCHG
+	MOV	A,H
+	ORA	L
+	CNZ	DECOUT
+	MOV	A,E
+	ADI	'0'
+	CALL	CTYPE
+	POP	H
+	POP	D
+	POP	B
+	RET
+;\
+;
+; ---> RDRECD  Reads a record from memory
+;
+
+
+RDRECD:	LHLD	RECPTR		;get buffer address
+	LXI	D,128		;add length of one record
+	DAD	D		;  to next buffer
+	SHLD	RECPTR		;save buffer address
+
+	.z80
+	push	hl
+	push	de
+	ld	hl,(length)
+	ld	de,128
+	scf
+	ccf
+	sbc	hl,de		; Carry = EOF
+	ld	(length),hl
+	pop	de
+	pop	hl
+	ret
+
+	.8080
+
+;
+; ---> WRRECD  Write a record
+;
+; Writes the record into memory
+;
+; Entry point "WRBLOCK" flushes the buffer at EOF
+;
+WRRECD:	LHLD	RECPTR		;get buffer address
+	LXI	D,128		;add length of one record
+	DAD	D		;  to next buffer
+	SHLD	RECPTR		;save buffer address
+	RET
+;
+;----> RECV  Receive a character
+;
+; Timeout time is in 'B' in seconds.  Entry via 'RECVDG' deletes garbage
+; characters on the line.  For example, having just sent a record,
+; calling 'RECVDG' will delete any line-noise-induced characters "long"
+; before the ACK/NAK would be received.
+;
+RECVDG:	call	kbdst		; nothing in Queue, so continue
+	jz	recv		
+	CALL	kbdin2		; clear char from queue.
+	jmp	recvdg
+;
+RECV:	PUSH	D		;save 'DE' regs.
+	MVI	E,4		;get the clock speed
+	XRA	A		;clear the 'A' reg.
+;
+MSLOOP:	ADD	B		;number of seconds
+	DCR	E		;one less mhz. to go
+	JNZ	MSLOOP		;if not zero, continue
+	MOV	B,A		;put total value back into 'B'
+;
+MSEC:	LXI	D,6600		;1 second DCR count
+;
+MWTI:	CALL	kbdst		;input from modem ready
+;
+	JNZ	MCHAR		;got the character
+	DCR	E		;count down for timeout
+	JNZ	MWTI
+	DCR	D
+	JNZ	MWTI
+	DCR	B		;more seconds?
+	JNZ	MSEC		;yes, wait
+;
+;
+; Modem timed out receiving - but carrier is still on.
+;
+	POP	D		;restore 'DE'
+	STC			;carry shows timeout
+	RET
+;.....
+;
+;
+; Get character from modem.
+;
+MCHAR:	CALL	kbdin		;get data byte from modem
+	POP	D		;restore 'DE'
+;
+;
+; Calculate Checksum and CRC
+;
+	PUSH	PSW		;save the character
+	CALL	UPDCRC		;calculate CRC
+	ADD	C		;add to checksum
+	MOV	C,A		;save checksum
+	POP	PSW		;restore the character
+	ORA	A		;carry off: no error
+	RET			;from 'RECV'
+;
+; Delay - 100 millisecond delay.
+;
+DELAY:	PUSH	B		;save 'BC'
+	LXI	B,4*4167	;value for 100 ms. delay
+;
+DELAY2:	DCX	B		;update count
+	MOV	A,B		;get MSP byte
+	ORA	C		;count = zero?
+	JNZ	DELAY2		;if not, continue
+	POP	B		;restore 'BC'
+	RET			;return to CARCK1
+;
+; ---> SEND  Send a character to the modem
+;
+SEND:	PUSH	PSW		;save the character
+	CALL	UPDCRC		;calculate CRC
+	ADD	C		;calcculate checksum
+	MOV	C,A		;save cksum
+	pop	psw
+;
+SENDW:	jmp	crtout
+;
+;
+; ---> WAITNAK	Waits for initial NAK
+;
+; To ensure no data is sent until the receiving program is ready, this
+; routine waits for the first timeout-nak or the letter 'C' for CRC
+; from the receiver.  If CRC is in effect, then Cyclic Redundancy Checks
+; are used instead of checksums.  'E' contains the number of seconds to
+; wait.
+;
+; If the first character received is a CAN (CTL-X) then the send will be
+; aborted as though it had timed out.
+;
+WAITNAK:MVI	B,1		;timeout delay
+	CALL	RECV		;did we get
+	CPI	CRC		;'CRC' indicated?
+	RZ			;yes, send block
+	CPI	NAK		;a 'NAK' indicating checksum?
+	JZ	SETNAK		;yes go put checksum in effect
+	CPI	CAN		;was it a cancel (CTL-X)?
+	JZ	ABORT		;yes, abort
+	DCR	E		;finished yet?
+	JZ	ABORT		;yes, abort
+	JMP	WAITNAK 	;no, loop
+;.....
+;
+;
+; ---> WAITCRC	Turn on CRC flag
+;
+SETNAK:	MVI	A,'C'           ;make sure in checksum
+	STA	CRCFLG
+	RET
+;
+;***********************************************************************
+;
+;			CRC SUBROUTINES
+;
+;***********************************************************************
+;
+;
+CHKCRC:	PUSH	H		;check 'CRC' bytes of received message
+	LHLD	CRCVAL
+	MOV	A,H
+	ORA	L
+	POP	H
+	RZ
+	MVI	A,0FFH
+	RET
+;.....
+;
+;
+CLRCRC:	PUSH	H		;reset 'CRC' store for a new message
+	LXI	H,0
+	SHLD	CRCVAL
+	POP	H
+	RET
+;.....
+;
+;
+FINCRC:	PUSH	PSW		;finish 'CRC' calculation for final xmsn
+	XRA	A
+	CALL	UPDCRC
+	CALL	UPDCRC
+	PUSH	H
+	LHLD	CRCVAL
+	MOV	D,H
+	MOV	E,L
+	POP	H
+	POP	PSW
+	RET
+;.....
+;
+;
+UPDCRC:	PUSH	PSW		;update 'CRC' store  with byte in 'A'
+	PUSH	B
+	PUSH	H
+	MVI	B,8
+	MOV	C,A
+	LHLD	CRCVAL
+;
+UPDLOOP:MOV	A,C
+	RLC
+	MOV	C,A
+	MOV	A,L
+	RAL
+	MOV	L,A
+	MOV	A,H
+	RAL
+	MOV	H,A
+	JNC	SKIPIT
+	MOV	A,H		;the generator is x^16 + x^12 + x^5 + 1
+	XRI	10H
+	MOV	H,A
+	MOV	A,L
+	XRI	21H
+	MOV	L,A
+;
+SKIPIT:	DCR	B
+	JNZ	UPDLOOP
+	SHLD	CRCVAL
+	POP	H
+	POP	B
+	POP	PSW
+	RET
+
+;***********************************************************************
+;
+; Temporary storage area (found in SBCMON.MAC)
+;
+;***********************************************************************
+
+
+extrn	OPTSAV
+extrn	CRCFLG		;sets to 'C' if checksum requested
+extrn	CRCVAL		;current CRC value
+extrn	ERRCDE		;receive error code
+extrn	ERRCT		;error count
+extrn	FRSTIM		;turned on after first 'SOH' received
+extrn	RCVRNO		;record number received
+extrn	RECDNO		;current record number
+
+extrn	recptr		; start of transfer in memory
+extrn	length		; length of transfer
+extrn	retaddr		; return address for calling routine
+
+	END
+

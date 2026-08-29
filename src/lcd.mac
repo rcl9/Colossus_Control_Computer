@@ -1,0 +1,1082 @@
+.comment\
+*************************************************************************
+*
+*  LCD Driver Module for the Colossus SBC
+*
+* Newly rewritten by RCL on July 2026 for a 40x2 HD44780 (or 
+* similar SPLC780C) controller and a 4002 40x2 Charcter LCD Module
+*
+*	(Rob's Retro Computing Archive)
+*	RetroComputingArchive@gmail.com
+*	https://github.com/rcl9
+*
+*************************************************************************
+
+Note: the 'busy' status bit from the controller doesn't seem to work or
+	be properly recognized and hence I'm choosing to use fixed
+	delays instead.
+
+https://dawes.wordpress.com/2010/01/05/hd44780-instruction-set/
+https://elm-chan.org/docs/lcd/hd44780_e.html
+https://www.jameco.com/Jameco/Blog/working-with-hd44780-liquid-crystal-displays.html
+\
+
+		.z80			; separately compiled module
+
+		BS		equ	08h		; back space
+LF		equ	0ah		; line feed
+CLEARSCRN	equ	0ch		; clear display
+CR		equ	0dh		; carriage return
+CURSDWN		equ	01ah		; cursor down
+CURSUP		equ	017h		; cursor up
+CURSRGHT	equ	013h		; cursor right
+CURSLEFT	equ	001h		; cursor left
+
+
+;	----- External Declarations ------
+
+public		lcd$table, test$lcd$display, testa, testb
+
+extrn		eot
+extrn		l1			; lcd line 1 memory image (40 bytes)
+extrn		l2                      ; lcd line 2 memory image (40 bytes)
+extrn		lcd$column              ; last column (0-39) accessed
+extrn		lcd$line                ; last lcd row accessed (0-1)
+extrn		lcd$dr                  ; current lcd data register
+extrn		lcd$timedout
+extrn		print$string
+extrn		pr$string$rs232
+extrn		kbdin
+extrn		crlf
+extrn		put4hs
+extrn		dis$asc
+
+; The lcd may be split into two windows - the top line and the bottom line.
+; When split=0, then the lcd is in full screen mode.
+; When split=1, the top line is a scrolling single line window, and the
+;		bottom line is a non-scrolling window. Each is accessed
+;		by moving the cursor into that window.
+
+extrn	split			; lcd split(1)/full-screen(0) mode
+
+;		----- Lcd Interface -----
+
+lcd$ctrl	equ	28h	; LCD display control register
+lcd$data	equ	29h	; LCD display data register
+
+; write
+lcd_cls     equ     01h     ; Clear display
+lcd_home    equ     02h     ; Return home
+lcd_entMd   equ     04h     ; Entry mode set (cursor move direction and display shift)
+lcd_entSh   equ     01h     ;   display shift bit - increment address counter after writing to data register
+lcd_entCd   equ     02h     ;   display cursor move diection bit = Increment
+lcd_donMod  equ     08h     ; Display on/off control (display, cursor, blink)
+lcd_donD    equ     04h     ;   Display on/off
+lcd_donC    equ     02h     ;   Underline cursor on/off
+lcd_donB    equ     01h     ;   Block cursor [blink?] on/off
+lcd_cdShft  equ     10h     ; Display shift
+lcd_cdC     equ     08h     ;   Shift S/C (shift display / move cursor)
+lcd_cdR     equ     04h     ;   Shift right / shift left
+
+lcd_set8bit equ     3fh     ; 8-bit port, 2-line display, 5x7 matrix
+lcd_curOn   equ     0fh     ; Block and underline cursors on (lcd_donMod + lcd_donD + lcd_donC + lcd_donB)
+lcd_curOff  equ     0Ch     ; Block and underline cursors on (lcd_donMod + lcd_donD)
+
+lcd_setcgradd equ   40h     ; Set CGRAM address (bit 0-5 contain address)
+lcd_setdramad equ   80h     ; Set DDRAM address (bit 0-6 contain address)
+
+lcd_1strow  equ     0h      ; Default address 1st char, 1st row.
+lcd_2ndrow  equ     40h     ; Default address 1st char, 2nd row.
+
+; 		-----  Lcd Related Equates  -----
+
+busy		equ	80h			; lcd busy indicator
+chcnt		equ	40			; characters / line
+
+;----------------------------------------------------------------------
+; This is the LCD function dispatch table
+
+lcd$table:	defw	lcd$print		; print A to LCD - main entry point from the monitor
+		defw	lcd$on			; turn display on
+		defw	lcd$off			; turn display off
+		defw	lcd$on$cursor		; turn cursor on
+		defw	lcd$off$cursor		; turn cursor off
+		defw	lcd$move$cursor		; move cursor to D,E
+		defw	lcd$return$cursor	; return cursor position in D,E
+		defw	lcd$clear		; clear both lines & home
+		defw	lcd$init		; initialize the display
+		defw	lcd$mode		; set full screen/split screen mode
+
+; --------------------------------------------------------------------
+; Lcd print, print A on display following the split/full-screen restrictions.
+; This is called by the main sbcmon.mac monitor code at 'lcdout' via the RST vector 0.
+
+lcd$print:	cp	CR		; carriage return (no LF) ?
+		jr	nz,trylf
+		xor	a
+		ld	(lcd$column),a	; start at column 0
+		call	lcdcupd		; update the cursor
+		ret
+
+trylf:		cp	LF		; line feed?
+		jr	z,yeslf
+trydwn:		cp	CURSDWN		; cursor down?
+		jr	nz,trybs
+
+yeslf:		ld	a,(split)	; see if split screen (vertically)
+		or	a
+		jp	nz,upscroll	; yes, just clear current line
+		ld	a,(lcd$line)	; else, ge current full window line
+		inc	a		; go down one line
+		cp	2		; see if past bottom line
+		jr	c,lfupd		; cursor still on line 0 or 1, ok
+		call	upscroll	; scroll window up one line
+		ld	a,1		; set to bottom line
+lfupd:		ld	(lcd$line),a	; update cursor line
+		jp	lcdcupd		; update the cursor position
+
+trybs:		cp	BS		; back space?
+		jr	z,yesbs
+		cp	CURSLEFT	; cursor left?
+		jr	nz,tryrht
+yesbs:		ld	a,(lcd$column)
+		or	a
+		ret	z		; return if already at left colm
+		dec	a
+		ld	(lcd$column),a
+		jp	lcdcupd		; update the cursor position
+
+tryrht:		cp	CURSRGHT	; cursor right?
+		jr	nz,tryup
+		ld	a,(lcd$column)
+		cp	chcnt - 1	; at end of the line?
+		ret	z		; yes, don't move any more
+		inc	a
+		ld	(lcd$column),a
+		jp	lcdcupd		; update the cursor
+
+tryup:		cp	CURSUP		; cursor up?
+		jr	nz,tryclear
+		ld	a,(split)	; split screen mode?
+		or	a
+		jp	nz,dnscroll	; yes, just clear the current line
+		ld	a,(lcd$line)	; see what line we're on
+		cp	0
+		jr	z,up41
+		dec	a		; move from line 2 to line 1
+		ld	(lcd$line),a	; update new line
+		jr	up5
+up41:		call	dnscroll	; scroll screen down 1 line
+up5:		jp	lcdcupd		; update the cursor position
+
+tryclear:	cp	CLEARSCRN	; clear screen
+		jp	z,lcd$clear	; yes, go clear it
+
+display:	cp	' '
+		ret	c		; return if control character
+		cp	07fh
+		ret	nc		; return if >= 7fh
+		push	af		; save the character
+		ld	hl,l1		; default to line 1 image
+		ld	a,(lcd$line)	; see what line we're on
+		cp	0		; line 1?
+		jr	z,yes1		; yes, skip
+		ld	hl,l2		; point to line 2 image
+yes1:		ld	d,0
+		ld	a,(lcd$column)	; get cursor column
+		ld	e,a
+		add	hl,de		; compute new buffer address
+		pop	af		; get the character back
+		ld	(hl),a		; update image memory
+		push	af		; save it again
+
+; now update the character to the screen directly
+
+		ld	a,(lcd$column)
+		ld	b,a		; B = cursor offset from left column of lcd
+inseg1:		ld	a,(lcd$line)	; then see which line
+		or	a		; top line?
+		ld	c, lcd_setdramad + lcd_1strow ; point to start of top line
+		jr	z,yestop
+		ld	c,lcd_setdramad + lcd_2ndrow ; else, point to start of bottom line
+yestop:		ld	a,b		; add actual cursor offset from left side
+
+		cp	chcnt		; Don't output the character if we are past the end of line
+		jr	nc, lcd$exit2
+
+		add	a,c		; add cursor move command offset
+		ld	c,lcd$ctrl	; set C for the call to the control register
+		call	outlcd		; and send out the command
+		ld	c,lcd$data
+		pop	af		; get back the character
+		call	outlcd		; and send the character to the display
+
+; then update the cursor addess
+
+updcurs:	ld	a,(lcd$column)	; get cursor column offset
+		inc	a
+
+; RCL, let the count go past 40 so that we can detect this situation in lcdcupd...
+;		cp	chcnt		; see if past end of line
+;		ret	z		; dont update the cursor if eol
+
+		ld	(lcd$column),a
+		jp	lcdcupd		; update the cursor location
+
+lcd$exit2:	ld	a,(lcd$column)	; Increment past column 40 so that we can detect this situation upon the next output
+		inc	a
+		ld	(lcd$column),a
+		pop	af
+		ret
+
+; --------------------------------------------------------------------
+; turn lcd display on
+
+lcd$on:		ld	a, lcd_set8bit	; display on command
+		ld	c, lcd$ctrl
+		call	outlcd 		; send to both sections
+
+		; Delay 5ms
+		ld	a, 5		; Delay 5ms
+		call	delay$1ms
+
+		ret
+
+; --------------------------------------------------------------------
+; turn both lcds off
+
+lcd$off:	ld	a, lcd_donMod	; display off command
+		ld	c, lcd$ctrl
+		call	outlcd 		; send to both sections
+		ret
+
+; --------------------------------------------------------------------
+; turn lcd cursor on
+
+lcd$on$cursor:
+		push	bc
+		ld      a, lcd_curOn
+		ld	c, lcd$ctrl
+		call	outlcd 			; send to both sections
+		pop	bc
+
+		; Delay 5ms
+		ld	a, 5		; Delay 5ms
+		call	delay$1ms
+
+		jp	lcdcupd		; use standard cursor update routine
+
+; --------------------------------------------------------------------
+; turn lcd cursor off
+
+lcd$off$cursor:	jp	curoff		; use standard cursor off routine
+
+; --------------------------------------------------------------------
+; move the lcd cursor to x,y = d,e (0-39, 0-1)
+
+lcd$move$cursor:ld	a,d
+		cp	chcnt		; > 40 characters?
+		jr	c,mv1		; no, skip
+		ld	a,chcnt-1	; default to last column then
+mv1:		ld	(lcd$column),a
+
+		ld	a,e		; get new line number
+		cp	2		; outside of 0-1 range?
+		jr	c,mv2		; no, skip
+		ld	a,1		; default to bottom line then
+mv2:		ld	(lcd$line),a
+		jp	lcdcupd		; update the cursor location
+
+; --------------------------------------------------------------------
+; Return the address of the LCD cursor position (d=column, e=line)
+
+lcd$return$cursor:
+		ld	a,(lcd$column)
+		ld	d,a
+		ld	a,(lcd$line)
+		ld	e,a
+		ret
+
+; --------------------------------------------------------------------
+; Clear both lines & move cursor home (stays in same line if split mode)
+
+lcd$clear:	ld	hl,l1		; clear line 1 buffer
+		call	clear
+		ld	hl,l2		; clear line 2 buffer
+		call	clear
+		xor	a		; home to current line
+		ld	(lcd$column),a
+		ld	a,(split)	; split screen?
+		or	a
+		jr	nz,clear1	; yes, dont change line #
+		ld	(lcd$line),a	; init cursor to line 1
+clear1:		call	lcdupd		; and update the display
+		ret
+
+; --------------------------------------------------------------------
+; Initialize LCD to boot up condition
+
+lcd$init:	jp	lcdint
+
+; --------------------------------------------------------------------
+; Set LCD widow mode, 0 (full) or 1 (split screen)
+
+lcd$mode:	cp	2		; only 0-1 allowed
+		ret	nc		; error.. return
+		ld	(split),a	; set new mode
+		ret
+
+;------------------------------------------------------------------
+;
+;  lcdint:
+;    	the lcdint procedure is the initializing procedure for
+;	the lcd where the following parameters must be preset:
+;
+;              	1 - display must be reset for both sections
+;		2 - display must be cleared for both sections
+;		3 - the display turned on for both sections
+;		4 - turn on cursor & position it properly
+;
+;---------------------------------------------------------------------------
+
+lcdint:
+		ld	a,0
+		ld	(lcd$timedout), a
+
+		; NOTE; you cannot check the busy flag until 8-bit mode has been set and allowed to settle down
+
+		; Need to wait more than 15ms before status register is valid. 100ms is better
+		;
+		; Delay 100 ms at 2 MHz
+		ld	a, 100		; Delay 100ms
+		call	delay$1ms
+
+; Display '1' on the first LED for status update
+; ld	a, 1
+; ld	e, 0
+; call	dis$asc
+
+		; Set the interface to 8-bit mode and reset
+		ld	a, lcd_set8bit
+		ld	c, lcd$ctrl
+		out 	(c), a 			; Output directly without any check for the busy flag
+
+		; Delay 5ms
+		ld	a, 5		; Delay 5ms
+		call	delay$1ms
+
+		; Set the interface to 8-bit mode and reset again
+		ld	a, lcd_set8bit
+		ld	c, lcd$ctrl
+		out 	(c), a 			; Output directly without any check for the busy flag
+
+; Display '1' on the first LED for status update
+; ld	a, 2
+; ld	e, 1
+; call	dis$asc
+
+		; Wait 100us before moving on
+		call	delay$50us
+		call	delay$50us
+
+; Display '1' on the first LED for status update
+; ld	a, 3
+; ld	e, 2
+; call	dis$asc
+
+		; According to the HD44780 data sheet a delay greater than 37 microseconds (50us ok) will be
+; sufficient for most commands. A few longer commands such as Return home and Clear display
+; will require a delay greater than 1.5 milliseconds.
+
+		ld	a,lcd_cls		; clear section
+		ld	c, lcd$ctrl
+		call 	outlcd 			; send to both sections
+
+		; Delay 2ms for the clear command
+		ld	a, 2		; Delay 2ms
+		call	delay$1ms
+
+		ld	a, lcd_curOn		; turn display on
+		ld	c, lcd$ctrl
+		call 	outlcd 			; send to both sections
+
+		xor	a
+		ld	(split),a		; full screen
+		ld	(lcd$column),a		; init to home postion
+		ld	(lcd$line),a
+
+; Display '1' on the first LED for status update
+; ld	a, 4
+; ld	e, 3
+; call	dis$asc
+
+		call	lcdcupd			; turn on & position cursor
+
+		ld	hl,l1
+		call	clear			; clear top line buffer
+		ld	hl,l2
+		call	clear			; clear bottom line buffer
+
+; Display '1' on the first LED for status update
+; ld	a, 5
+; ld	e, 4
+; call	dis$asc
+
+		ret
+
+;---------------------------------------------------------------
+;
+;		u p s c r o l l   r o u t i n e
+;
+;	the upscroll routine will scroll the display up
+;	by one line.
+;
+;	algorithm:
+;
+;	procedure scroll window up
+;	begin
+;		if split_mode then
+;			clear current line
+;		else
+;			block move line 2 to line 1
+;			clear bottom line
+;		end if
+;		update lcd
+;	end
+;
+;---------------------------------------------------------------------
+
+upscroll:	ld	a,(split)	; obtain the split screen flag
+		or	a
+		jr	nz,up3		; split screen, jump
+
+; Scroll both lines...
+
+up2:		ld	hl,l2		; move line 2 to line 1
+		ld	de,l1
+		ld	bc,chcnt
+		ldir
+
+		ld	hl,l2		; point to top line memory buffer address
+		call	clear		; and clear the line
+
+up4:		call	lcdupd		; update the lcd screen
+		ret
+
+; Scroll only the current line (split screen mode)
+
+up3:		ld	a,(lcd$line)	; get current line
+		or	a
+		jr	nz,onl2
+
+		ld	hl,l1		; point to top line memory buffer address
+		call	clear		; and clear the line
+		ret
+
+onl2:		ld	hl,l2		; point to top line memory buffer address
+		call	clear		; and clear the line
+		ret
+
+;---------------------------------------------------------------------
+;
+;		d n s c r o l l    r o u t i n e
+;
+;	the dnscroll routine will cause the virtual window
+;	to scroll down one line on the lcd.
+;
+;	algorithm:
+;
+;	procedure scroll window down
+;	begin
+;		if split_mode then
+;			clear current line
+;		else
+;			block move line 1 to line 2
+;			clear top line
+;		end if
+;		update lcd
+;	end
+;
+;-------------------------------------------------------------------------
+
+dnscroll:	ld	a,(split)	; get split sreen flag
+		or	a		; see if split screen
+		jr	nz,up3		; split, go back & clear current line
+
+; Scroll both lines...
+
+do2:		ld	hl,l1		; move line 1 to line 2
+		ld	de,l2
+		ld	bc,chcnt
+		ldir
+
+		ld	hl,l1		; point to top line memory buffer address
+		call	clear		; and clear the line
+
+do4:		call	lcdupd		; update the lcd screen
+		ret
+
+;--------------------------------------------------------------
+
+; Clear 40 characters pointed to by HL to spaces.
+; 	NOTE: B destroyed.
+
+clear:		ld	b,chcnt		; number of characters per line
+		ld	a,' '		; clear line to spaces
+cl1:		ld	(hl),a		; and go clear the buffer
+		inc	hl
+		djnz	cl1
+		ret
+
+;--------------------------------------------------------------
+;
+;		l c d u p d   r o u t i n e
+;
+;	the lcdupd routine will update the lcd with the lines
+;	calculated by the respective routines.
+;
+;	algorithm:
+;
+;	procedure update the lcd
+;	begin
+;		lcdout(address l1,lcd top line address start)
+;		lcdout(address l2,lcd bottom line address start)
+;		if l1=cursor then lcd cursor := outcur(column,l1)
+;		else if l2=cursor then lcd cursor:=outcur(column,l2)
+;	end
+;
+;----------------------------------------------------------------
+
+lcdupd:		call	curoff		; turn off cursor
+
+		ld	hl,l1		; point to line 1
+		ld	c, lcd_setdramad + lcd_1strow	; address command offset to line1 of lcd (0)
+		call	lcdout		; output data
+
+		ld	hl,l2		; point to line 2
+		ld	c, lcd_setdramad + lcd_2ndrow	; address command offset to line2 of lcd
+		call	lcdout		; output data
+
+		call	lcdcupd		; update the cursor location
+		ret
+
+;----------------------------------------------------------------
+;
+;		l c d c u p d    r o u t i n e
+;
+; 	Update the cursor position to that in the memory image
+;	(lcd$column, lcd$line)
+;
+;----------------------------------------------------------------
+
+lcdcupd:	ld	c,lcd_setdramad + lcd_1strow	; lcd top line address offset
+		ld	a,(lcd$line)	; cursor line no
+		or	a		; test if line 1
+		jr	z,lcdcu1	; yes, cursor on line 1
+		ld	c, lcd_setdramad + lcd_2ndrow	; lcd bottom line address offset
+lcdcu1:		call	outcur		; update & turn on cursor
+		ret
+
+;----------------------------------------------------------------
+;
+;		l c d o u t     r o u t i n e
+;
+;	The lcdout routine will take input from the lcd bufer
+;	indicated by [hl] and output it to the lcd display address
+;	location indicated by [c]. It effectively updates one line
+;	of the lcd with its correspondig memory image.
+;
+;	c = 80h or 0c0h always (offset = 0 from start of each 40 column line)
+;	hl = lcd buffer or lcd buffer + 80
+;
+;	[c] 	-  offset to line 1 or line 2 of each lcd segment (80H or C0H)
+;	[hl]	-  device input start address
+;
+;------------------------------------------------------------------
+
+lcdout:		push	af
+		push	bc
+		push	de
+		push	hl
+
+		ld	a,(lcd$timedout)
+		or	a
+		jr	nz, lcd$exit
+
+		ld	d,c		; save the lcd addr - offset
+		ld	e,c		; lcd addr will be saved in e
+
+out1:
+		ld	a,e		; current lcd addr
+		ld	c, lcd$ctrl
+		call	outlcd		; set up lcd address
+
+		ld	c,lcd$data	; data reg
+		ld	a,(hl)		; pick up character from buffer
+		inc	hl		; next char from memory
+		call	outlcd		; output char to lcd
+
+out2:		inc	e		; next lcd address
+		ld	a,e		; get DISPLAY_ADDR
+		sub	d		; subtract OFFSET
+
+out3:		cp	chcnt
+		jr	nz,out1		; no next char from device
+
+lcd$exit:	pop	hl
+		pop	de
+		pop	bc
+		pop	af
+		ret
+
+;----------------------------------------------------------------
+;
+;		o u t c u r    r o u t i n e
+;
+;	the outcur routine will place the cursor in the proper
+;	location on the lcd screen.
+;
+;	[c] - lcd line address (080h or 0c0h, for line 1 or line 2 offset)
+;
+;---------------------------------------------------------------------
+
+outcur:		push	af
+		push	bc
+		push	de
+
+		ld	e, c		; Save offset
+
+		call	curoff
+
+		ld	a,(lcd$column)	; cursor position
+		cp	chcnt-1		; > 40 characters?
+		jr	c,outcur2	; no, skip
+		ld	a,chcnt-1	; default to last column
+
+outcur2:	add	a, e		; lcd addr for cursor
+		ld	c, lcd$ctrl
+		call	outlcd		; put out cursor addr
+
+		ld      a, lcd_curOn
+		ld	c, lcd$ctrl
+		call	outlcd		; put out cursor addr
+
+		pop	de
+		pop	bc
+		pop	af
+		ret
+
+
+;----------------------------------------------------------------------------
+;
+;		c u r o f f    r o u t i n e
+;
+;	the cursor off routine
+;
+;--------------------------------------------------------------------------
+
+curoff:		ld	a, lcd_curOff	; cursor off command
+		ld	c, lcd$ctrl
+		jp	outlcd 		; send out command
+
+;--------------------------------------------------------------------
+;
+;		o u t l c d    r o u t i n e
+;
+;	Wait loop for the lcd which checks the busy flag in the
+;	control register
+;
+;	A = command value
+;	C = LCD register to output (control or data)
+;
+;-------------------------------------------------------------------
+
+outlcd:
+
+; Note: the 'busy' status bit from the controller doesn't seem to work or
+;	be properly recognized and hence I'm choosing to use fixed
+;	delays instead.
+.comment\
+		push	bc
+		push	hl
+		push	af
+
+		; If we've timed out in the past then exit now
+		ld	a,(lcd$timedout)
+		or	a
+		jr	nz, exit
+
+continue:
+		; RCL, May 29 2026, time-out in case the LCD is dead or is not attached
+		ld	hl, 0ffffh
+
+lwait1:		dec	hl
+		ld	a,h
+		or	l
+		jr	z, lcd$timeout
+
+		ld	c, lcd$ctrl
+		in	a,(c)
+		and	busy
+		jr	nz,lwait1
+
+lcd$exit2:	pop	af
+		pop	hl
+		pop	bc
+\
+
+		; RCL, July 24 2026, I'm going to send out the command after we know the busy
+		; flag is off.
+		out	(c),a
+
+		; Delay 50us for generic LCD commands (at least 37us)
+		call	delay$50us
+
+		ret
+
+.comment\
+lcd$timeout:
+		ld	a, 0ffh
+		ld	(lcd$timedout), a
+		call	pr$string$rs232
+		defb	'  --> The panel has timed out. No further communications will be made with it.',cr,lf,eot
+
+exit:		pop	af
+		pop	hl
+		pop	bc
+
+		ret
+\
+
+; Delay 1ms * value in 'A' for Z80 running at 2Mhz
+
+delay$1ms:
+	LD	B, 151           ; [7]  Initialize the loop counter
+	NOP                 ; [4]  Padding to hit the exact cycle count
+	NOP                 ; [4]  Padding to hit the exact cycle count
+
+DelayLoop:
+	DJNZ	DelayLoop	; [13] T-states when jumping back (happens 150 times)
+				; [8]  T-states when finishing the loop (happens 1 time)
+	dec	a
+	jr	nz, delay$1ms
+	RET
+
+; Delay 50us - most LCD commands should be fine with more than 37us
+
+delay$50us:
+	LD B, 3         ; [7]  Initialize loop counter
+	JR $+2          ; [12] Padding (Jumps to the next instruction)
+	NOP             ; [4]  Padding
+	NOP             ; [4]  Padding
+	NOP             ; [4]  Padding
+	NOP             ; [4]  Padding
+	NOP             ; [4]  Padding
+DelayLoop2:
+	DJNZ 	DelayLoop2 ; [34] T-states total (13 x 2 jumps + 8 for the final exit)
+	ret
+
+;--------------------------------------------------------------------
+;
+;		Test the LCD code
+;
+;-------------------------------------------------------------------
+
+test$lcd$display:
+	xor	a
+	ld	(split),a		; full screen
+	ld	(lcd$column),a		; init to home postion
+	ld	(lcd$line),a
+
+.comment\
+	call	pr$string$rs232
+	defb	'Reset. Key.',cr,lf, eot
+
+	; Set the interface to 8-bit mode and reset
+	ld	a, lcd_set8bit
+	ld	c, lcd$ctrl
+	out 	(c), a 			; Output directly without any check for the busy flag
+
+	; Wait 100us before moving on
+	call	delay$50us
+	call	delay$50us
+
+	; Set the interface to 8-bit mode again
+	out 	(c), a 			; Output directly without any check for the busy flag
+
+	call	kbdin		; wait for a key input
+\
+
+.comment\
+	call	pr$string$rs232
+	defb	'Clearing. Key',cr,lf, eot
+
+	ld	a, lcd_cls
+	ld	c, lcd$ctrl
+	out 	(c), a 			; Output directly without any check for the busy flag
+
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Cursor on. Key',cr,lf, eot
+
+	ld	a, lcd_curOn		; turn display on
+	ld	c, lcd$ctrl
+	call 	outlcd 			; send to both sections
+
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'3 >. Key',cr,lf, eot
+
+	ld	a, '>'
+	call	lcd$print
+	ld	a, '>'
+	call	lcd$print
+	ld	a, '>'
+	call	lcd$print
+
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Cursor middle 1st line + >. Key',cr,lf, eot
+	ld	a, 20
+	ld	(lcd$column),a		; init to home postion
+	call	lcdcupd			; turn on & position cursor
+	ld	a, '>'
+	call	lcd$print
+
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Cursor middle 2nd + >. Key',cr,lf, eot
+	ld	a, 20
+	ld	(lcd$column),a		; init to home postion
+	ld	a, 1
+	ld	(lcd$line),a
+	call	lcdcupd			; turn on & position cursor
+	ld	a, '>'
+	call	lcd$print
+
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'lcd$print x 3 top row ###. Key',cr,lf, eot
+	ld	a, 0
+	ld	(lcd$line),a
+	ld	a, 0
+	ld	(lcd$column),a		; init to home postion
+	ld	a, '#'
+	call	lcd$print
+	ld	a, 20
+	ld	(lcd$column),a		; init to home postion
+	ld	a, '#'
+	call	lcd$print
+	ld	a, 39
+	ld	(lcd$column),a		; init to home postion
+	ld	a, '#'
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'lcd$print x 3 2nd row ###. Key',cr,lf, eot
+	ld	a, 1
+	ld	(lcd$line),a
+	ld	a, 0
+	ld	(lcd$column),a		; init to home postion
+	ld	a, '#'
+	call	lcd$print
+	ld	a, 20
+	ld	(lcd$column),a		; init to home postion
+	ld	a, '#'
+	call	lcd$print
+	ld	a, 39
+	ld	(lcd$column),a		; init to home postion
+	ld	a, '#'
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Clearning screen. Key',cr,lf, eot
+	ld	a, CLEARSCRN
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'### then CR-LF down to line 2 and then #. Key',cr,lf, eot
+	ld	a, '#'
+	call	lcd$print
+	ld	a, '#'
+	call	lcd$print
+	ld	a, '#'
+	call	lcd$print
+	ld	a, CR
+	call	lcd$print
+	ld	a, LF
+	call	lcd$print
+	ld	a, '#'
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Cursor up to line 1 then #. Key',cr,lf, eot
+	ld	a, CURSUP
+	call	lcd$print
+	ld	a, '#'
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Cursor right 2x. Key',cr,lf, eot
+	ld	a, CURSRGHT
+	call	lcd$print
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Cursor left 2x. Key',cr,lf, eot
+	ld	a, CURSLEFT
+	call	lcd$print
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	ld	a, 1
+	ld	(split),a
+	ld	a, CLEARSCRN
+	call	lcd$print
+
+	call	pr$string$rs232
+	defb	'Going into split screen mode. 1+2 to both lines. Key',cr,lf, eot
+	ld	a, 0
+	ld	(lcd$line),a
+	call	lcdcupd			; turn on & position cursor
+	ld	a, '1'
+	call	lcd$print
+	ld	a, 1
+	ld	(lcd$line),a
+	call	lcdcupd			; turn on & position cursor
+	ld	a, '2'
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Scrolling 1st line + 1. Key',cr,lf, eot
+	ld	a, 0
+	ld	(lcd$line),a
+	call	lcdcupd			; turn on & position cursor
+	ld	a, LF
+	call	lcd$print
+	ld	a, '1'
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Scrolling 2nd line + 2. Key',cr,lf, eot
+	ld	a, 1
+	ld	(lcd$line),a
+	call	lcdcupd			; turn on & position cursor
+	ld	a, LF
+	call	lcd$print
+	ld	a, '2'
+	call	lcd$print
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Turning display off. Key',cr,lf, eot
+	call	lcd$off
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Turning display on. Key',cr,lf, eot
+	call	lcd$on
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Cursor off. Key',cr,lf, eot
+	call	lcd$off$cursor
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Cursor on. Key',cr,lf, eot
+	call	lcd$on$cursor
+	call	kbdin		; wait for a key input
+
+	call	pr$string$rs232
+	defb	'Clearing both buffers. Key',cr,lf, eot
+
+	call	lcd$clear			; clear top line buffer
+
+	call	kbdin		; wait for a key input
+\
+	ret
+
+;--------------------------------------------------------------------
+;
+;		More LCD hardware testing code
+;
+;-------------------------------------------------------------------
+
+; This test outputs a user-defined value to the LCD control port and reports back how long
+; the busy timeout was
+
+testa:
+.comment\
+		dec	a		;check if parameter count=1. 'l' will contain first arg
+		scf
+		ret	nz
+
+		ld	a,l		; pick up the value to be output
+		ld	c, lcd$ctrl
+		out	(c),a
+
+		ld	hl, 0ffffh
+lwait2:		dec	hl
+		ld	a,h
+		or	l
+;		jr	z, lcd$timeout
+
+		ld	c, lcd$ctrl
+		in	a,(c)
+		and	busy
+		jr	nz,lwait2
+
+		call	put4hs		;print HL in hex
+		call	crlf
+\
+		ret
+
+; This test will output a specific value continuously to the LCD display
+
+testb:
+.comment\
+		dec	a		;check if parameter count=1. 'l' will contain first arg
+		scf
+		ret	nz
+
+		ld	b,l		; pick up the value to be output
+
+looper:
+		ld	a, b
+		ld	c, lcd$ctrl
+		out	(c),a
+
+lcd$timeout2: 	ld	hl, 0ffffh
+lwait3:		dec	hl
+		ld	a,h
+		or	l
+		jr	z, lcd$timeout2
+
+		ld	c, lcd$ctrl
+		in	a,(c)
+		and	busy
+		jr	nz,lwait3
+
+		jr	looper
+\
+		ret
+
+	END
+
+; ----------------------  End Of LCD Driver  -----------------------
+
+

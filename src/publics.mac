@@ -1,0 +1,86 @@
+.comment\
+**************************************************************
+*
+* Public definitions for Colossus SBCMON.MAC
+*
+*    By RCL9
+*	(Rob's Retro Computing Archive)
+*	RetroComputingArchive@gmail.com
+*	https://github.com/rcl9
+*
+**************************************************************\
+
+; December 22/85
+
+public	rst$io$driver		; Centronics, LCD and LED dispatcher
+public	rst$rs232$driver	; I/O to the Sio, channels A - Console I/O, Keyboard input
+public	rst$midi$driver		; I/O to Sio channel B - Midi I/O
+public	rst$system$driver	; Odd system functions
+
+; Publics for Speak.mac
+
+public		sc01_base
+public		port25$image
+public		inflec
+public		lrflag
+public		saveix
+public		ixptr
+public		getlin
+public		print$string
+public		pr$string$rs232
+public		pmsg
+public		sc01$timedout
+public		kbdin
+public		crlf
+public		put4hs
+public		dis$asc
+public		led$clear
+public		put2hs
+
+; Publics for Xmodem.mac
+
+public	clear$rs232$buffers
+public  crtout
+public	kbdin
+public	kbdin2
+public	kbdst
+
+public	print$string
+
+public	optsav
+public	crcflg
+public	crcval
+public	errcde
+public	errct
+public	frstim
+public	rcvrno
+public	recdno
+public	recptr
+public	length
+public	retaddr
+
+public	dec$out
+public	pio$a$8255
+public	pio$c$8255
+public	mem$bot
+public	linbuf
+public	inp$dec
+public	asc$dec
+public	crlf
+
+public	cr
+public	lf
+public	eot
+
+; LCD interface related labels
+
+public		l1
+public		l2
+public		lcd$column
+public		lcd$line
+public		lcd$cr
+public		lcd$dr
+public		split
+public		lcd$timedout
+
+
