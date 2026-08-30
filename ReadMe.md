@@ -1,6 +1,6 @@
 # The 'Colossus Control Computer' -- A Beast of a Z80 Machine!
 
-This repository documents my "Colossus Control Computer" which was my main go-to development machine ("It has every feature including the kitchen sink") that was started in March 1985. 
+This repository documents my "Colossus Control Computer" which was my main go-to development machine ("It has every feature including the kitchen sink") that was started in March 1985.
 
 <div style="text-align:center">
 <img src="/Images/Img052.webp" alt="" style="width:75%; height:auto;">
@@ -8,7 +8,10 @@ This repository documents my "Colossus Control Computer" which was my main go-to
 <img src="/Images/Img12.webp" alt="" style="width:75%; height:auto;">
 </div>
 
-I call it a "beast of a Z80 machine" because it has more odds and ends + add-on gadgets than with most self-built computers. It was also the test bed and development platform for my follow-on March 1987 "Phoenix MIDI Computer". An interesting sub-project for Colossus was my Dec 1985 '[Drum Pad Triggers for a MIDI Drum Machine](https://github.com/rcl9/MIDI_Drum_Pad_Triggers)'.
+I call it a "beast of a Z80 machine" because it has more odds and ends + add-on gadgets than with
+most self-built computers. It was also the test bed and development platform for my follow-on
+March 1987 <a href="https://github.com/rcl9/Phoenix_MIDI_Computer">Phoenix MIDI Computer</a>.
+An interesting sub-project for Colossus was my Dec 1985 '[Drum Pad Triggers for a MIDI Drum Machine](https://github.com/rcl9/MIDI_Drum_Pad_Triggers)'.
 
 ## Table of Contents
 
@@ -25,7 +28,7 @@ I call it a "beast of a Z80 machine" because it has more odds and ends + add-on 
 - Z80A 8-bit processor running at 4Mhz.
 - Z80 CTC general purpose timer
 - Z80 SIO (serial I/O). Port A = RS-232, Port B = MIDI with MIDI to MIDI pass-through mode
-- Z80 PIO (parallel I/O) to interface 
+- Z80 PIO (parallel I/O) to interface
 - 8253 programmable timer
 - 8255 parallel ports A, B and C
 - 8279 to interface to the keyboard and the 8 segment LED display
@@ -37,7 +40,7 @@ I call it a "beast of a Z80 machine" because it has more odds and ends + add-on 
 - Atari 800 cartridge 30-pin interface
 - Roland M-16C and M-64C synthesizer patch cartridge interface
 - 5-1/4" floppy disk controller and interface
-- 2 line, 40-position Hitachi HD44780 LCD display 
+- 2 line, 40-position Hitachi HD44780 LCD display
 - 8 segment custom LED display
 - 8 channel, 8-bit multiplexed analog-to-digital converter based on the TI ADC0809 to measure 8 potentiometers
 - [9 drum pad triggers](https://github.com/rcl9/MIDI_Drum_Pad_Triggers) (using piezo-electric microphones)
@@ -64,7 +67,7 @@ I call it a "beast of a Z80 machine" because it has more odds and ends + add-on 
 ## Block Diagrams
 
 <div style="text-align:center">
-<img src="/Schematics/Overview document/Main board block diagram - Dec 2 1985.webp" alt="" style="width:75%; height:auto;">   
+<img src="/Schematics/Overview document/Main board block diagram - Dec 2 1985.webp" alt="" style="width:75%; height:auto;">
 </div>
 
 <div style="text-align:center">
@@ -184,7 +187,7 @@ Memory map:
 
 <tr><td>Main board I/O map</td>
 <td><img src="/Schematics/Main board IO map.webp" alt="" style="width:20%; height:auto;"</td></tr>
-	
+
 <tr><td>MIDI driver functions</td>
 <td><img src="/Schematics/MIDI driver functions - Feb 14 1987.webp" alt="" style="width:20%; height:auto;"</td></tr>
 
